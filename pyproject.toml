@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "abook-agent"
+version = "0.1.0"
+description = "A local knowledge assistant built with PydanticAI"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic-ai>=2.9,<3",
+    "python-dotenv>=1.2,<2",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
