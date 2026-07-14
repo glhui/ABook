@@ -11,6 +11,10 @@ ABook 是一个使用 [PydanticAI](https://ai.pydantic.dev/) 构建的命令行�
 - 通过模型 ID、API Key 和 `base_url` 调用 OpenAI 兼容服务。
 - 使用本地 `TestModel` 完成不消耗 API 额度的自动化测试。
 
+仓库顶层的 `experiments/skill_runtime/` 还包含一个独立实验：使用 Pydantic
+验证 Skill manifest，并通过 PydanticAI 内部工具渐进加载 `SKILL.md` 和
+声明过的 reference。该实验不属于 `src/abook_agent/` 产品包，不影响当前 CLI。
+
 ## 工作原理
 
 ```text
@@ -50,7 +54,10 @@ ABook/
 |   `-- knowledge.py   # 文档模型与 JSON 知识库
 |-- tests/
 |   |-- test_agent.py  # 存储和 Agent 离线测试
-|   `-- test_config.py # 模型配置离线测试
+|   |-- test_config.py # 模型配置离线测试
+|   `-- test_skill_runtime.py # Skill Runtime 离线测试
+|-- experiments/
+|   `-- skill_runtime/ # Agent Skill 编排与安全加载实验
 |-- .env.example       # 环境变量模板，不包含真实密钥
 |-- AGENTS.md          # 项目编码与协作约束
 |-- pyproject.toml     # 包信息和运行依赖
