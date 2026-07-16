@@ -54,17 +54,26 @@ WorkspaceContextBuilder 不调用模型、不枚举工作区文件、不读取�
 
 项目指令按作用域从宽到窄排列，更接近当前工作目录的 AGENTS.md 具有更高优先
 级。`ContextRuntime.create_agent_context` 再为 root 或子 Agent 选择 Skill，
-并保存该 Agent 自己的任务与消息历史。Runtime 在模型调用前把共享工作区指令和
-当前 Agent 的 Skill 组合起来；用户任务仍作为独立的 user message 发送。
+并保存该 Agent 自己的任务与消息历史。Runtime 只把共享工作区约束和当前 Skill
+放入 instructions，并明确项目约束高于 Skill。可变 `TaskState`、证据目录和当前
+请求通过 user message 发送；状态被标记为数据，不能覆盖固定指令或当前请求。
 
 `run_agent` 从当前 `AgentContext.message_history` 读取历史，并在一轮结束后写回
 `AgentRunResult.all_messages()`。因此 root 和 worker 共享工作区事实，但不会
-混用消息历史。当前实验没有实现历史压缩。
+混用消息历史。每个 Agent 的上下文窗口按 1,000,000 tokens 管理；历史估算达到
+70%（700,000 tokens）时，Runtime 使用同一模型压缩较早消息，保留任务目标、
+约束、决定、修改、验证和未决问题，并尽量保留最近一轮原始消息。模型提供 usage
+时使用真实 token 数，离线模型没有 usage 时才使用字符数估算。压缩输出是结构化
+检查点：Runtime 先校验并合并事实与未决事项，成功后才用摘要替换旧历史；未知
+证据或工具结果中不存在的引用原文会触发模型重试，原历史不会提前丢弃。
 
-`TaskState` 保存当前任务的目标、计划、已完成步骤、重要事实、完成条件、修改
-文件、验证结果和总体状态。root Agent 通过 `update_task_state` 更新计划性字段；
-文件修改和验证结果只由实际工具调用记录。Runtime 在每次 Agent 运行前将当前
-TaskState 渲染进工作上下文，模型不必只依赖聊天历史恢复任务进度。
+`TaskState` 保存当前任务的目标、计划、已完成步骤、重要事实、未决事项、完成
+条件、修改文件、验证结果和总体状态。工作区工具为实际结果登记顺序
+`evidence_id`，同时保存模型实际看到的有界结果文本。root Agent 通过
+`update_task_state` 提交重要事实时，必须同时提供 ID 和结果中的逐字 `quote`；
+Runtime 验证 quote 确实存在后，才将其合并为长期 `TaskFact`，后续状态更新不会
+覆盖已有事实。未决事项可在问题解决后显式替换。文件修改和验证结果仍只由实际
+工具调用记录。
 
 ## 执行工具
 
@@ -83,7 +92,9 @@ TaskState 渲染进工作上下文，模型不必只依赖聊天历史恢复任�
 工具通过 `AgentDependencies` 同时获得 `ContextRuntime` 和当前 `AgentContext`。
 工作区工具只读取共享路径；`select_skill` 只修改当前 Agent 的 Skill。所有路径都由宿主解析并验证，
 不能通过 `..` 或符号链接越过工作区。结果数量、读取字符数和搜索文件数均有
-上限。`.env` 不会被列出、读取或搜索。
+上限。`.env` 不会被列出、读取或搜索。文本工具在首行返回 `evidence_id`，命令
+工具在结构化 `CommandResult` 中返回该字段；证据记录还保留实际返回文本，供
+`FactClaim` 的 quote 做精确子串校验。
 
 精确替换成功后，Runtime 自动把相对路径加入 `TaskState.modified_files`。Python
 测试、编译和 `pip check` 实际执行后，Runtime 自动记录命令、退出码和超时状态；
@@ -120,7 +131,9 @@ runtime 的命令边界；因此需要分支或工作区状态时，Agent 应通
 和 `continue_subagent`，
 因此不能继续创建孙 Agent。首次委派返回的 `session_id` 标识该子 Agent；验证
 失败或需要补充修改时，父 Agent 可调用 `continue_subagent` 并显式传回原消息
-历史。会话只保存在当前父 Agent 运行的内存中，不做持久化、并行调度或跨进程恢复。
+历史。每轮交接包含结构化摘要、已解析证据、实际修改文件、实际验证结果和未决
+问题；其中修改与验证由宿主根据本轮工具调用补入，不能由子 Agent 声称。会话只
+保存在当前父 Agent 运行的内存中，不做持久化、并行调度或跨进程恢复。
 
 ## 运行
 

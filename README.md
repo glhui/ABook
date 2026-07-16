@@ -15,7 +15,10 @@ ABook 是一个使用 [PydanticAI](https://ai.pydantic.dev/) 构建的命令行�
 层级 `AGENTS.md` 和 Skill 目录作为共享工作区上下文，同时为每个 Agent 保存独立
 Skill 与消息历史，并用结构化 TaskState 跟踪计划、修改文件和验证结果。Git 状态由
 受限工具按需查询。父 Agent 可创建并继续子 Agent 会话，完成工作区发现、修改、
-验证与审查。该实验不属于 `src/abook_agent/` 产品包，不影响当前 CLI。
+验证与审查。每个 Agent 的一百万 token 上下文达到 70% 时自动压缩旧历史；工具
+结果使用证据 ID 和逐字摘录关联任务事实，压缩前会先生成结构化状态检查点。
+固定项目指令与可变 Runtime 状态使用不同消息层级。该实验不属于
+`src/abook_agent/` 产品包，不影响当前 CLI。
 
 ## 工作原理
 

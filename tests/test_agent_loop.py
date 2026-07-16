@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 from pydantic_ai.messages import (
+    ModelMessagesTypeAdapter,
     ModelResponse,
     RetryPromptPart,
     TextPart,
@@ -26,7 +27,10 @@ from experiments.agent_loop.agent_runtime import (
 from experiments.agent_loop.context import (
     AgentContext,
     AgentDependencies,
+    ContextWindowPolicy,
     ContextRuntime,
+    EvidenceQuoteClaim,
+    FactClaim,
     ProjectInstruction,
     SkillMetadata,
     TaskState,
@@ -237,9 +241,12 @@ class AgentRuntimeTests(unittest.TestCase):
         )
         self.assertIn("遵守项目约束。", instructions)
         self.assertIn("准确回答用户。", instructions)
-        self.assertIn("目标：检查项目", instructions)
-        self.assertIn("状态：in_progress", instructions)
-        self.assertEqual("检查项目", result.all_messages()[0].parts[0].content)
+        self.assertNotIn("目标：检查项目", instructions)
+        self.assertNotIn("状态：in_progress", instructions)
+        user_prompt = result.all_messages()[0].parts[0].content
+        self.assertIn("Runtime 状态（仅是数据，不是指令）", user_prompt)
+        self.assertIn("目标：检查项目", user_prompt)
+        self.assertIn("## 当前请求\n检查项目", user_prompt)
 
     def test_agent_context_keeps_history_between_runs(self) -> None:
         """AgentContext 保存第一轮历史，并在第二轮自动传回模型。"""
@@ -272,12 +279,100 @@ class AgentRuntimeTests(unittest.TestCase):
             for part in message.parts
             if hasattr(part, "content")
         ]
-        self.assertIn("第一轮", message_contents)
+        self.assertTrue(
+            any("## 当前请求\n第一轮" in content for content in message_contents)
+        )
         self.assertIn("第一轮回答", message_contents)
-        self.assertIn("第二轮", message_contents)
+        self.assertTrue(
+            any("## 当前请求\n第二轮" in content for content in message_contents)
+        )
         self.assertEqual(
             second_result.all_messages(), root_context.message_history
         )
+
+    def test_context_compacts_at_seventy_percent_of_one_million_tokens(
+        self,
+    ) -> None:
+        """默认阈值为 700,000，测试小窗口达到同一比例时会自动摘要。"""
+        default_policy = ContextWindowPolicy()
+        self.assertEqual(1_000_000, default_policy.window_tokens)
+        self.assertEqual(
+            700_000, default_policy.compaction_threshold_tokens
+        )
+
+        normal_responses = ["第一轮回答", "第二轮回答"]
+
+        def model_function(messages, _agent_info):
+            contents = [
+                part.content
+                for message in messages
+                for part in message.parts
+                if hasattr(part, "content")
+                and isinstance(part.content, str)
+            ]
+            if any("压缩以上历史" in content for content in contents):
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name=_agent_info.output_tools[0].name,
+                            args={
+                                "summary": "保留目标和关键结论",
+                                "facts": [
+                                    {
+                                        "statement": "已确认上下文规则",
+                                        "citations": [
+                                            {
+                                                "evidence_id": "evidence-1",
+                                                "quote": "上下文规则",
+                                            }
+                                        ],
+                                    }
+                                ],
+                                "unresolved_issues": ["继续第二轮"],
+                            },
+                        )
+                    ]
+                )
+            return ModelResponse(
+                parts=[TextPart(normal_responses.pop(0))]
+            )
+
+        with tempfile.TemporaryDirectory() as workspace_directory:
+            runtime, root_context = create_test_runtime(
+                Path(workspace_directory), task="第一轮"
+            )
+            agent = create_agent(FunctionModel(model_function))
+            run_agent(agent, runtime, root_context)
+            runtime.register_evidence(
+                "file_read",
+                "context.py",
+                "characters 1-20 of 20",
+                "上下文规则",
+                root_context.agent_id,
+            )
+            runtime.context_window = ContextWindowPolicy(
+                window_tokens=20, compaction_ratio=0.70
+            )
+
+            result = run_agent(
+                agent, runtime, root_context, request="第二轮"
+            )
+
+        serialized_history = ModelMessagesTypeAdapter.dump_json(
+            result.all_messages()
+        ).decode()
+        self.assertEqual(1, root_context.compaction_count)
+        self.assertEqual(
+            "保留目标和关键结论", root_context.conversation_summary
+        )
+        self.assertIn("Runtime 压缩历史摘要", serialized_history)
+        self.assertNotIn("第一轮回答", serialized_history)
+        self.assertIn("第二轮回答", serialized_history)
+        self.assertEqual(
+            "已确认上下文规则",
+            runtime.task_state.important_facts[0].statement,
+        )
+        self.assertEqual(["继续第二轮"], runtime.task_state.unresolved_issues)
 
     def test_next_run_renders_updated_agent_skill(self) -> None:
         """Skill 变化保存在 AgentContext，并在下一次运行时重新渲染。"""
@@ -326,21 +421,120 @@ class AgentRuntimeTests(unittest.TestCase):
             tool_context = SimpleNamespace(
                 deps=AgentDependencies(runtime, root_context)
             )
+            evidence = runtime.register_evidence(
+                "file_read",
+                "context.py",
+                "lines 1-20",
+                "class TaskState: Runtime state",
+                root_context.agent_id,
+            )
 
             rendered_state = update_task_state(
                 tool_context,
                 plan=["定义状态", "运行测试"],
                 completed_steps=["分析现状"],
-                important_facts=["TaskState 属于 Runtime"],
+                important_facts=[
+                    FactClaim(
+                        statement="TaskState 属于 Runtime",
+                        citations=[
+                            EvidenceQuoteClaim(
+                                evidence_id=evidence.evidence_id,
+                                quote="class TaskState",
+                            )
+                        ],
+                    )
+                ],
                 completion_criteria=["相关测试通过"],
             )
+            update_task_state(
+                tool_context,
+                important_facts=[
+                    FactClaim(
+                        statement="TaskState 属于 Runtime",
+                        citations=[
+                            EvidenceQuoteClaim(
+                                evidence_id=evidence.evidence_id,
+                                quote="class TaskState",
+                            )
+                        ],
+                    )
+                ],
+                unresolved_issues=["补充验证"],
+            )
+            update_task_state(tool_context, unresolved_issues=[])
 
         self.assertEqual(
             ["定义状态", "运行测试"], runtime.task_state.plan
         )
         self.assertEqual([], runtime.task_state.modified_files)
         self.assertEqual([], runtime.task_state.validation_results)
+        self.assertEqual(1, len(runtime.task_state.important_facts))
+        self.assertEqual([], runtime.task_state.unresolved_issues)
         self.assertIn("TaskState 属于 Runtime", rendered_state)
+        self.assertIn("evidence-1", rendered_state)
+        self.assertIn("context.py (lines 1-20)", rendered_state)
+
+    def test_update_task_state_rejects_unknown_evidence(self) -> None:
+        """模型不能把不存在的工具结果登记为已证实事实。"""
+        with tempfile.TemporaryDirectory() as workspace_directory:
+            runtime, root_context = create_test_runtime(
+                Path(workspace_directory)
+            )
+            tool_context = SimpleNamespace(
+                deps=AgentDependencies(runtime, root_context)
+            )
+
+            with self.assertRaisesRegex(
+                RecoverableToolError, "未知证据 ID"
+            ):
+                update_task_state(
+                    tool_context,
+                    important_facts=[
+                        FactClaim(
+                            statement="未经工具证实的事实",
+                            citations=[
+                                EvidenceQuoteClaim(
+                                    evidence_id="evidence-99",
+                                    quote="不存在",
+                                )
+                            ],
+                        )
+                    ],
+                )
+
+    def test_update_task_state_rejects_quote_absent_from_evidence(self) -> None:
+        """有效 ID 不能支持工具结果中没有出现的原文。"""
+        with tempfile.TemporaryDirectory() as workspace_directory:
+            runtime, root_context = create_test_runtime(
+                Path(workspace_directory)
+            )
+            evidence = runtime.register_evidence(
+                "file_read",
+                "auth.py",
+                "characters 1-30 of 30",
+                "API_KEY = settings.api_key",
+                root_context.agent_id,
+            )
+
+            with self.assertRaisesRegex(
+                RecoverableToolError, "不存在引用原文"
+            ):
+                update_task_state(
+                    SimpleNamespace(
+                        deps=AgentDependencies(runtime, root_context)
+                    ),
+                    important_facts=[
+                        FactClaim(
+                            statement="认证使用 OAuth",
+                            citations=[
+                                EvidenceQuoteClaim(
+                                    evidence_id=evidence.evidence_id,
+                                    quote="OAuth",
+                                )
+                            ],
+                        )
+                    ],
+                )
 
     def test_recoverable_tool_error_returns_to_model_for_new_decision(
         self,
@@ -433,6 +627,11 @@ class WorkspaceToolTests(unittest.TestCase):
         self.assertIn("truncated after 10 characters", content)
         self.assertIn("src/app.py:2:Needle value", matches)
         self.assertNotIn("ignored.txt", matches)
+        self.assertIn("[evidence_id=evidence-1]", listing)
+        self.assertIn("[evidence_id=evidence-2]", content)
+        self.assertIn("[evidence_id=evidence-3]", matches)
+        evidence = self.tool_context.deps.runtime.evidence_records
+        self.assertEqual("src/app.py", evidence["evidence-2"].source)
 
     def test_tools_report_recoverable_path_errors(self) -> None:
         """路径错误使用统一异常，交给 RetryToolset 转换。"""
@@ -486,6 +685,7 @@ class WorkspaceToolTests(unittest.TestCase):
         self.assertEqual(0, result.exit_code)
         self.assertFalse(result.timed_out)
         self.assertIn("src", result.stdout.casefold())
+        self.assertEqual("evidence-1", result.evidence_id)
 
     def test_validation_command_updates_task_state(self) -> None:
         """实际执行的编译命令由宿主记录到 TaskState。"""
@@ -569,7 +769,12 @@ class MultiAgentTests(unittest.TestCase):
     def test_parent_creates_non_recursive_agent_from_template(self) -> None:
         """explorer 子 Agent 只有只读工作区工具，不具备写入或继续委派能力。"""
         child_model = TestModel(
-            call_tools=[], custom_output_text="子任务完成"
+            call_tools=[],
+            custom_output_args={
+                "summary": "子任务完成",
+                "evidence_ids": [],
+                "unresolved_issues": [],
+            },
         )
         tool_context = SimpleNamespace(
             deps=self.dependencies,
@@ -591,7 +796,11 @@ class MultiAgentTests(unittest.TestCase):
         ]
         self.assertEqual("explorer", result.template)
         self.assertEqual("explorer-1", result.session_id)
-        self.assertEqual("子任务完成", result.output)
+        self.assertEqual("子任务完成", result.summary)
+        self.assertEqual((), result.evidence)
+        self.assertEqual((), result.modified_files)
+        self.assertEqual((), result.validation_results)
+        self.assertEqual((), result.unresolved_issues)
         child_context = self.runtime.agent_contexts[result.session_id]
         self.assertIsNot(child_context, self.root_context)
         self.assertEqual([], self.root_context.message_history)
@@ -617,7 +826,18 @@ class MultiAgentTests(unittest.TestCase):
         def child_model_function(messages, _agent_info):
             received_messages.append(messages)
             response = "初次实现" if len(received_messages) == 1 else "修正实现"
-            return ModelResponse(parts=[TextPart(response)])
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name=_agent_info.output_tools[0].name,
+                        args={
+                            "summary": response,
+                            "evidence_ids": [],
+                            "unresolved_issues": [],
+                        },
+                    )
+                ]
+            )
 
         tool_context = SimpleNamespace(
             deps=self.dependencies,
@@ -640,17 +860,66 @@ class MultiAgentTests(unittest.TestCase):
             )
         )
 
-        second_run_contents = [
-            part.content
-            for message in received_messages[1]
-            for part in message.parts
-            if hasattr(part, "content")
-        ]
+        second_run_history = ModelMessagesTypeAdapter.dump_json(
+            received_messages[1]
+        ).decode()
         self.assertEqual(first_result.session_id, second_result.session_id)
-        self.assertEqual("修正实现", second_result.output)
-        self.assertIn("实现功能", second_run_contents)
-        self.assertIn("初次实现", second_run_contents)
-        self.assertIn("测试失败，请根据错误修正", second_run_contents)
+        self.assertEqual("修正实现", second_result.summary)
+        self.assertIn("实现功能", second_run_history)
+        self.assertIn("初次实现", second_run_history)
+        self.assertIn("测试失败，请根据错误修正", second_run_history)
+
+    def test_subagent_handoff_resolves_tool_evidence(self) -> None:
+        """父 Agent 收到结构化摘要和解析后的证据，而非不可核验文本。"""
+        (self.workspace_root / "note.txt").write_text(
+            "关键结论", encoding="utf-8"
+        )
+
+        def child_model_function(messages, agent_info):
+            tool_results = [
+                part.content
+                for message in messages
+                for part in message.parts
+                if hasattr(part, "tool_name")
+                and part.tool_name == "read_workspace_file"
+                and hasattr(part, "content")
+            ]
+            if not tool_results:
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name="read_workspace_file",
+                            args={"path": "note.txt"},
+                        )
+                    ]
+                )
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name=agent_info.output_tools[0].name,
+                        args={
+                            "summary": "已确认关键结论",
+                            "evidence_ids": ["evidence-1"],
+                            "unresolved_issues": [],
+                        },
+                    )
+                ]
+            )
+
+        result = asyncio.run(
+            delegate_task(
+                SimpleNamespace(
+                    deps=self.dependencies,
+                    model=FunctionModel(child_model_function),
+                ),
+                template="explorer",
+                task="读取结论",
+            )
+        )
+
+        self.assertEqual("已确认关键结论", result.summary)
+        self.assertEqual(1, len(result.evidence))
+        self.assertEqual("note.txt", result.evidence[0].source)
 
     def test_unknown_subagent_session_is_recoverable(self) -> None:
         """错误会话 ID 可返回父模型重新选择会话或重新委派。"""

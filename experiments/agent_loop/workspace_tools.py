@@ -72,6 +72,7 @@ class CommandResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    evidence_id: str
     command: str
     exit_code: int | None
     stdout: str
@@ -98,6 +99,11 @@ class RetryToolset(WrapperToolset[AgentDependencies]):
             return await self.wrapped.call_tool(name, tool_args, ctx, tool)
         except RecoverableToolError as error:
             raise ModelRetry(str(error)) from error
+
+
+def _with_evidence(evidence_id: str, result: str) -> str:
+    """在文本工具结果首行暴露可供 TaskState 引用的证据 ID。"""
+    return f"[evidence_id={evidence_id}]\n{result}"
 
 
 def _resolve_workspace_path(
@@ -161,8 +167,19 @@ def list_workspace_files(
         )
 
     files = _iter_workspace_files(resolved_directory)
+    relative_directory = resolved_directory.relative_to(
+        ctx.deps.workspace_root
+    ).as_posix() or "."
     if not files:
-        return "No files found."
+        result = "No files found."
+        evidence = ctx.deps.runtime.register_evidence(
+            "file_listing",
+            relative_directory,
+            "0 files returned",
+            result,
+            ctx.deps.agent_context.agent_id,
+        )
+        return _with_evidence(evidence.evidence_id, result)
 
     displayed_files = files[:limit]
     lines = [
@@ -171,7 +188,15 @@ def list_workspace_files(
     ]
     if len(files) > limit:
         lines.append(f"... truncated; {len(files)} files found.")
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    evidence = ctx.deps.runtime.register_evidence(
+        "file_listing",
+        relative_directory,
+        f"returned {len(displayed_files)} of {len(files)} files",
+        result,
+        ctx.deps.agent_context.agent_id,
+    )
+    return _with_evidence(evidence.evidence_id, result)
 
 
 def read_workspace_file(
@@ -203,12 +228,25 @@ def read_workspace_file(
         raise RecoverableToolError(
             "文件不是 UTF-8 文本，请改用其他文件或工具。"
         ) from error
+    relative_path = resolved_path.relative_to(
+        ctx.deps.workspace_root
+    ).as_posix()
+    returned_characters = min(len(content), max_characters)
     if len(content) <= max_characters:
-        return content
-    return (
-        content[:max_characters]
-        + f"\n... truncated after {max_characters} characters."
+        result = content
+    else:
+        result = (
+            content[:max_characters]
+            + f"\n... truncated after {max_characters} characters."
+        )
+    evidence = ctx.deps.runtime.register_evidence(
+        "file_read",
+        relative_path,
+        f"characters 1-{returned_characters} of {len(content)}",
+        result,
+        ctx.deps.agent_context.agent_id,
     )
+    return _with_evidence(evidence.evidence_id, result)
 
 
 def search_workspace_text(
@@ -265,7 +303,23 @@ def search_workspace_text(
                 f"{line[:MAX_MATCH_LINE_LENGTH]}"
             )
             if len(matches) == limit:
-                return "\n".join(matches + ["... match results truncated."])
+                result = "\n".join(
+                    matches + ["... match results truncated."]
+                )
+                evidence = ctx.deps.runtime.register_evidence(
+                    "text_search",
+                    directory,
+                    f"query={query!r}; locations="
+                    + ", ".join(
+                        match.rsplit(":", 1)[0] for match in matches
+                    ),
+                    result,
+                    ctx.deps.agent_context.agent_id,
+                )
+                return _with_evidence(
+                    evidence.evidence_id,
+                    result,
+                )
 
     if not matches:
         matches.append("No matching text found.")
@@ -277,7 +331,15 @@ def search_workspace_text(
         matches.append(
             f"Skipped {skipped_non_utf8_files} non-UTF-8 files."
         )
-    return "\n".join(matches)
+    result = "\n".join(matches)
+    evidence = ctx.deps.runtime.register_evidence(
+        "text_search",
+        directory,
+        f"query={query!r}; returned {len(matches)} result line(s)",
+        result,
+        ctx.deps.agent_context.agent_id,
+    )
+    return _with_evidence(evidence.evidence_id, result)
 
 
 def replace_workspace_text(
@@ -344,9 +406,16 @@ def replace_workspace_text(
         ctx.deps.workspace_root
     ).as_posix()
     ctx.deps.runtime.task_state.record_modified_file(relative_path)
-    return (
-        f"Replaced {actual_replacements} occurrence(s) in "
-        f"{relative_path}."
+    evidence = ctx.deps.runtime.register_evidence(
+        "file_change",
+        relative_path,
+        f"replaced {actual_replacements} occurrence(s)",
+        f"old_text={old_text}\nnew_text={new_text}",
+        ctx.deps.agent_context.agent_id,
+    )
+    return _with_evidence(
+        evidence.evidence_id,
+        f"Replaced {actual_replacements} occurrence(s) in {relative_path}.",
     )
 
 
@@ -524,11 +593,25 @@ def run_powershell_command(
                 exit_code=None,
                 timed_out=True,
             )
+        stdout = _truncate_command_output(error.stdout)
+        stderr = _truncate_command_output(error.stderr)
+        evidence_content = (
+            f"timed_out=True\nexit_code=None\n"
+            f"stdout:\n{stdout}\nstderr:\n{stderr}"
+        )
+        evidence = ctx.deps.runtime.register_evidence(
+            "command",
+            command,
+            "timed out; exit_code=None",
+            evidence_content,
+            ctx.deps.agent_context.agent_id,
+        )
         return CommandResult(
+            evidence_id=evidence.evidence_id,
             command=command,
             exit_code=None,
-            stdout=_truncate_command_output(error.stdout),
-            stderr=_truncate_command_output(error.stderr),
+            stdout=stdout,
+            stderr=stderr,
             timed_out=True,
         )
 
@@ -538,11 +621,30 @@ def run_powershell_command(
             exit_code=completed_process.returncode,
             timed_out=False,
         )
+    relative_working_directory = command_working_directory.relative_to(
+        ctx.deps.workspace_root
+    ).as_posix() or "."
+    stdout = _truncate_command_output(completed_process.stdout)
+    stderr = _truncate_command_output(completed_process.stderr)
+    evidence_content = (
+        f"exit_code={completed_process.returncode}\n"
+        f"working_directory={relative_working_directory}\n"
+        f"stdout:\n{stdout}\nstderr:\n{stderr}"
+    )
+    evidence = ctx.deps.runtime.register_evidence(
+        "command",
+        command,
+        f"exit_code={completed_process.returncode}; "
+        f"working_directory={relative_working_directory}",
+        evidence_content,
+        ctx.deps.agent_context.agent_id,
+    )
     return CommandResult(
+        evidence_id=evidence.evidence_id,
         command=command,
         exit_code=completed_process.returncode,
-        stdout=_truncate_command_output(completed_process.stdout),
-        stderr=_truncate_command_output(completed_process.stderr),
+        stdout=stdout,
+        stderr=stderr,
         timed_out=False,
     )
 
