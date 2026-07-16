@@ -77,7 +77,35 @@ class AgentCallLimits:
 
 @dataclass(frozen=True)
 class AgentTurnResult(Generic[OutputT]):
-    """一次完成的 Agent 调用及其 Runtime 元数据。"""
+    """一次成功完成的 Agent 调用及其 Runtime 元数据。
+
+    该对象是 ``AgentRunner.run_turn`` 的统一返回值；它在模型成功结束后才创建，
+    此时 ``messages`` 已写回对应 ``AgentContext``。``raw_result`` 保留 PydanticAI
+    原始结果，供现有 CLI 或需要访问完整 usage 的调用方继续使用。
+
+    Attributes:
+        output: 模型的最终输出。root Agent 通常是 ``str``，子 Agent 通常是结构化
+            ``SubagentReport``。
+        messages: 本轮结束后的完整私有消息历史，包含此前历史、本轮 user message、
+            模型响应和工具调用结果；不会包含其他 Agent 的私有历史。
+        requests: 本轮消耗的全部模型请求数，包含主 Agent 调用和压缩调用。
+        tool_calls: 本轮执行的全部工具调用数，包含主 Agent 和压缩调用产生的计数。
+        input_tokens: 全部模型请求的输入 token 总数；包含压缩前发送给摘要模型的
+            旧历史。
+        output_tokens: 全部模型请求的输出 token 总数；包含主输出和压缩摘要。
+        compacted: 本轮主 Agent 调用前是否发生过历史压缩。
+        compaction_requests: ``requests`` 中属于压缩检查点的模型请求数；未压缩时为
+            ``0``，通常为 ``1``，但模型需要修正无效证据引用时可能大于 ``1``。
+        turn_index: 当前 Agent 私有会话的成功轮次，从 ``1`` 开始；root 的第 4 次
+            请求和某个 worker 的第 4 次请求各自都可为 ``4``。
+        raw_result: PydanticAI 返回的 ``AgentRunResult``，用于访问框架原始数据。
+
+    例如，worker 已完成 3 轮，第四轮开始前压缩旧历史。压缩模型请求 1 次，主
+    Agent 因工具重试请求 2 次，则 ``turn_index=4``、``compacted=True``、
+    ``compaction_requests=1``、``requests=3``。若该轮调用了读取文件和运行测试，
+    ``tool_calls`` 为相应工具调用总数；``input_tokens`` 和 ``output_tokens`` 则是
+    这 3 次模型请求的合计，而不是仅主 Agent 最后一次请求的用量。
+    """
 
     output: OutputT
     messages: list[ModelMessage]
