@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 
+from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import (
     ModelMessagesTypeAdapter,
     ModelResponse,
@@ -20,7 +21,10 @@ from experiments.agent_loop.agent_runtime import (
     continue_subagent,
     create_agent,
     delegate_task,
+    inspect_subagent,
+    list_subagents,
     run_agent,
+    run_agent_turn,
     select_skill,
     update_task_state,
 )
@@ -37,6 +41,8 @@ from experiments.agent_loop.context import (
     WorkspaceContext,
     WorkspaceContextBuilder,
 )
+from experiments.agent_loop.main import run_conversation
+from experiments.agent_loop.runner import AgentCallLimits, AgentRunner
 from experiments.agent_loop.workspace_tools import (
     RecoverableToolError,
     list_workspace_files,
@@ -186,6 +192,44 @@ class WorkspaceContextBuilderTests(unittest.TestCase):
                     working_directory=Path(external_directory),
                 )
 
+    def test_child_runtime_state_hides_other_agent_evidence(self) -> None:
+        """子 Agent 只看到自己的证据目录，root 仍可汇总所有证据。"""
+        runtime = ContextRuntime(
+            WorkspaceContextBuilder(
+                self.workspace_root, self.skills_root
+            ).build(),
+            TaskState(goal="父任务"),
+        )
+        root_context = runtime.create_agent_context(
+            "root", "父任务", "general"
+        )
+        first_child = runtime.create_agent_context(
+            "explorer-1",
+            "任务一",
+            "general",
+            parent_agent_id="root",
+        )
+        second_child = runtime.create_agent_context(
+            "explorer-2",
+            "任务二",
+            "general",
+            parent_agent_id="root",
+        )
+        runtime.register_evidence(
+            "file_read", "first.txt", "lines 1-2", "first", first_child.agent_id
+        )
+        runtime.register_evidence(
+            "file_read", "second.txt", "lines 1-2", "second", second_child.agent_id
+        )
+
+        first_prompt = runtime.build_user_prompt(first_child, "继续")
+        root_prompt = runtime.build_user_prompt(root_context, "汇总")
+
+        self.assertIn("first.txt", first_prompt)
+        self.assertNotIn("second.txt", first_prompt)
+        self.assertIn("first.txt", root_prompt)
+        self.assertIn("second.txt", root_prompt)
+
 
 class AgentRuntimeTests(unittest.TestCase):
     """验证执行 Agent 的工具注册与上下文边界。"""
@@ -229,6 +273,8 @@ class AgentRuntimeTests(unittest.TestCase):
                 "select_skill",
                 "delegate_task",
                 "continue_subagent",
+                "list_subagents",
+                "inspect_subagent",
             ],
             [
                 tool.name
@@ -289,6 +335,92 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(
             second_result.all_messages(), root_context.message_history
         )
+        self.assertEqual(2, root_context.turn_count)
+
+    def test_conversation_reuses_root_context_until_exit_command(self) -> None:
+        """终端连续输入复用同一历史，并且退出命令不会进入模型消息。"""
+        requests = iter(["第二轮", "/quit"])
+        outputs: list[str] = []
+        with tempfile.TemporaryDirectory() as workspace_directory:
+            runtime, root_context = create_test_runtime(
+                Path(workspace_directory), task="第一轮"
+            )
+            run_conversation(
+                create_agent(
+                    TestModel(call_tools=[], custom_output_text="持续回答")
+                ),
+                runtime,
+                root_context,
+                "第一轮",
+                input_fn=lambda _prompt: next(requests),
+                output_fn=outputs.append,
+            )
+
+        serialized_history = ModelMessagesTypeAdapter.dump_json(
+            root_context.message_history
+        ).decode()
+        self.assertEqual(["持续回答", "持续回答"], outputs)
+        self.assertEqual(2, root_context.turn_count)
+        self.assertIn("## 当前请求\\n第一轮", serialized_history)
+        self.assertIn("## 当前请求\\n第二轮", serialized_history)
+        self.assertNotIn("/quit", serialized_history)
+
+    def test_async_agent_turn_returns_uniform_runtime_metadata(self) -> None:
+        """异步公开入口返回输出、usage、压缩标记和统一轮次。"""
+        with tempfile.TemporaryDirectory() as workspace_directory:
+            runtime, root_context = create_test_runtime(
+                Path(workspace_directory), task="异步调用"
+            )
+            turn = asyncio.run(
+                run_agent_turn(
+                    create_agent(
+                        TestModel(
+                            call_tools=[], custom_output_text="异步完成"
+                        )
+                    ),
+                    runtime,
+                    root_context,
+                )
+            )
+
+        self.assertEqual("异步完成", turn.output)
+        self.assertEqual(1, turn.turn_index)
+        self.assertFalse(turn.compacted)
+        self.assertEqual(0, turn.compaction_requests)
+        self.assertEqual(turn.messages, root_context.message_history)
+
+    def test_agent_runner_enforces_request_limit(self) -> None:
+        """所有 root 和子 Agent 调用共用 Runner 的模型请求上限。"""
+        def model_function(_messages, _agent_info):
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="list_workspace_files",
+                        args={"directory": ".", "limit": 10},
+                    )
+                ]
+            )
+
+        with tempfile.TemporaryDirectory() as workspace_directory:
+            runtime, root_context = create_test_runtime(
+                Path(workspace_directory), task="持续调用工具"
+            )
+            runner = AgentRunner(
+                AgentCallLimits(request_limit=1, tool_calls_limit=10)
+            )
+
+            with self.assertRaises(UsageLimitExceeded):
+                asyncio.run(
+                    runner.run_turn(
+                        create_agent(FunctionModel(model_function)),
+                        runtime,
+                        root_context,
+                        root_context.task,
+                    )
+                )
+
+        self.assertEqual(0, root_context.turn_count)
+        self.assertEqual([], root_context.message_history)
 
     def test_context_compacts_at_seventy_percent_of_one_million_tokens(
         self,
@@ -354,14 +486,17 @@ class AgentRuntimeTests(unittest.TestCase):
                 window_tokens=20, compaction_ratio=0.70
             )
 
-            result = run_agent(
+            turn = AgentRunner().run_turn_sync(
                 agent, runtime, root_context, request="第二轮"
             )
+            result = turn.raw_result
 
         serialized_history = ModelMessagesTypeAdapter.dump_json(
             result.all_messages()
         ).decode()
         self.assertEqual(1, root_context.compaction_count)
+        self.assertTrue(turn.compacted)
+        self.assertEqual(1, turn.compaction_requests)
         self.assertEqual(
             "保留目标和关键结论", root_context.conversation_summary
         )
@@ -771,9 +906,11 @@ class MultiAgentTests(unittest.TestCase):
         child_model = TestModel(
             call_tools=[],
             custom_output_args={
+                "status": "completed",
                 "summary": "子任务完成",
                 "evidence_ids": [],
                 "unresolved_issues": [],
+                "recommended_next_actions": [],
             },
         )
         tool_context = SimpleNamespace(
@@ -797,14 +934,19 @@ class MultiAgentTests(unittest.TestCase):
         self.assertEqual("explorer", result.template)
         self.assertEqual("explorer-1", result.session_id)
         self.assertEqual("子任务完成", result.summary)
+        self.assertEqual("completed", result.status)
+        self.assertEqual(1, result.turn_index)
         self.assertEqual((), result.evidence)
         self.assertEqual((), result.modified_files)
         self.assertEqual((), result.validation_results)
         self.assertEqual((), result.unresolved_issues)
+        self.assertEqual((), result.recommended_next_actions)
         child_context = self.runtime.agent_contexts[result.session_id]
         self.assertIsNot(child_context, self.root_context)
         self.assertEqual([], self.root_context.message_history)
         self.assertTrue(child_context.message_history)
+        self.assertEqual("root", child_context.parent_agent_id)
+        self.assertEqual(1, len(self.runtime.handoff_history))
         self.assertEqual(
             [
                 "list_workspace_files",
@@ -816,6 +958,8 @@ class MultiAgentTests(unittest.TestCase):
         )
         self.assertNotIn("delegate_task", child_tool_names)
         self.assertNotIn("continue_subagent", child_tool_names)
+        self.assertNotIn("list_subagents", child_tool_names)
+        self.assertNotIn("inspect_subagent", child_tool_names)
 
     def test_parent_continues_same_subagent_with_previous_history(
         self,
@@ -825,15 +969,26 @@ class MultiAgentTests(unittest.TestCase):
 
         def child_model_function(messages, _agent_info):
             received_messages.append(messages)
-            response = "初次实现" if len(received_messages) == 1 else "修正实现"
+            first_turn = len(received_messages) == 1
+            response = "初次实现" if first_turn else "修正实现"
             return ModelResponse(
                 parts=[
                     ToolCallPart(
                         tool_name=_agent_info.output_tools[0].name,
                         args={
+                            "status": (
+                                "needs_follow_up"
+                                if first_turn
+                                else "completed"
+                            ),
                             "summary": response,
                             "evidence_ids": [],
-                            "unresolved_issues": [],
+                            "unresolved_issues": (
+                                ["测试失败"] if first_turn else []
+                            ),
+                            "recommended_next_actions": (
+                                ["提供失败输出"] if first_turn else []
+                            ),
                         },
                     )
                 ]
@@ -856,7 +1011,7 @@ class MultiAgentTests(unittest.TestCase):
             continue_subagent(
                 tool_context,
                 session_id=first_result.session_id,
-                task="测试失败，请根据错误修正",
+                feedback="测试失败，请根据错误修正",
             )
         )
 
@@ -864,10 +1019,30 @@ class MultiAgentTests(unittest.TestCase):
             received_messages[1]
         ).decode()
         self.assertEqual(first_result.session_id, second_result.session_id)
+        self.assertEqual("needs_follow_up", first_result.status)
+        self.assertEqual(("测试失败",), first_result.unresolved_issues)
         self.assertEqual("修正实现", second_result.summary)
+        self.assertEqual("completed", second_result.status)
+        self.assertEqual(2, second_result.turn_index)
         self.assertIn("实现功能", second_run_history)
         self.assertIn("初次实现", second_run_history)
         self.assertIn("测试失败，请根据错误修正", second_run_history)
+        self.assertIn("上一轮结构化交接", second_run_history)
+        self.assertIn("needs_follow_up", second_run_history)
+        self.assertIn("提供失败输出", second_run_history)
+        snapshots = list_subagents(
+            SimpleNamespace(deps=self.dependencies)
+        )
+        self.assertEqual(1, len(snapshots))
+        self.assertEqual("completed", snapshots[0].status)
+        self.assertEqual(2, snapshots[0].turn_count)
+        self.assertEqual(
+            second_result,
+            inspect_subagent(
+                SimpleNamespace(deps=self.dependencies),
+                first_result.session_id,
+            ),
+        )
 
     def test_subagent_handoff_resolves_tool_evidence(self) -> None:
         """父 Agent 收到结构化摘要和解析后的证据，而非不可核验文本。"""
@@ -898,9 +1073,22 @@ class MultiAgentTests(unittest.TestCase):
                     ToolCallPart(
                         tool_name=agent_info.output_tools[0].name,
                         args={
+                            "status": "completed",
                             "summary": "已确认关键结论",
+                            "facts": [
+                                {
+                                    "statement": "note.txt 包含关键结论",
+                                    "citations": [
+                                        {
+                                            "evidence_id": "evidence-1",
+                                            "quote": "关键结论",
+                                        }
+                                    ],
+                                }
+                            ],
                             "evidence_ids": ["evidence-1"],
                             "unresolved_issues": [],
+                            "recommended_next_actions": [],
                         },
                     )
                 ]
@@ -920,6 +1108,10 @@ class MultiAgentTests(unittest.TestCase):
         self.assertEqual("已确认关键结论", result.summary)
         self.assertEqual(1, len(result.evidence))
         self.assertEqual("note.txt", result.evidence[0].source)
+        self.assertEqual(1, len(result.facts))
+        self.assertEqual(
+            "note.txt 包含关键结论", result.facts[0].statement
+        )
 
     def test_unknown_subagent_session_is_recoverable(self) -> None:
         """错误会话 ID 可返回父模型重新选择会话或重新委派。"""
@@ -932,7 +1124,7 @@ class MultiAgentTests(unittest.TestCase):
                 continue_subagent(
                     tool_context,
                     session_id="worker-99",
-                    task="继续修改",
+                    feedback="继续修改",
                 )
             )
 

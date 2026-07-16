@@ -3,13 +3,24 @@
 import os
 from pathlib import Path
 import sys
+from typing import Callable
 
 from dotenv import load_dotenv
+from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from .agent_runtime import create_agent, run_agent
-from .context import ContextRuntime, TaskState, WorkspaceContextBuilder
+from .context import (
+    AgentContext,
+    AgentDependencies,
+    ContextRuntime,
+    TaskState,
+    WorkspaceContextBuilder,
+)
+
+
+EXIT_COMMANDS = frozenset({"/quit", "/exit", "quit", "exit"})
 
 
 def create_model() -> OpenAIChatModel:
@@ -22,23 +33,62 @@ def create_model() -> OpenAIChatModel:
     return OpenAIChatModel(os.environ["ABOOK_MODEL"], provider=provider)
 
 
+def run_conversation(
+    agent: Agent[AgentDependencies, str],
+    runtime: ContextRuntime,
+    root_context: AgentContext,
+    initial_request: str,
+    input_fn: Callable[[str], str] = input,
+    output_fn: Callable[[str], None] = print,
+) -> None:
+    """在一个 root AgentContext 中持续处理终端输入。
+
+    每轮通过同一个 ``root_context`` 调用 Agent，因此消息历史、任务状态、证据和
+    子 Agent 交接会持续进入后续上下文。退出命令不会发送给模型，避免把会话控制
+    文本误当作用户任务。
+    """
+    request = initial_request.strip()
+    while True:
+        if request:
+            result = run_agent(agent, runtime, root_context, request)
+            output_fn(result.output)
+
+        try:
+            request = input_fn("You> ").strip()
+        except EOFError:
+            return
+        if request.casefold() in EXIT_COMMANDS:
+            return
+
+
 def main() -> None:
-    """组织上下文，运行带工作区工具的执行 Agent，并打印回答。"""
-    request = " ".join(sys.argv[1:]).strip()
-    if not request:
-        request = input("请输入请求：").strip()
-    if not request:
-        raise SystemExit("请求不能为空")
+    """创建一个 root 会话，并在终端中持续处理用户请求。"""
+    initial_request = " ".join(sys.argv[1:]).strip()
+    if not initial_request:
+        try:
+            initial_request = input("You> ").strip()
+        except EOFError:
+            return
+    if not initial_request or initial_request.casefold() in EXIT_COMMANDS:
+        return
 
     experiment_root = Path(__file__).parent
     workspace_context = WorkspaceContextBuilder(
         workspace_root=Path.cwd(),
         skills_root=experiment_root / "skills",
     ).build()
-    runtime = ContextRuntime(workspace_context, TaskState(goal=request))
-    root_context = runtime.create_agent_context("root", request, "general")
-    result = run_agent(create_agent(create_model()), runtime, root_context)
-    print(result.output)
+    runtime = ContextRuntime(
+        workspace_context, TaskState(goal=initial_request)
+    )
+    root_context = runtime.create_agent_context(
+        "root", initial_request, "general"
+    )
+    run_conversation(
+        create_agent(create_model()),
+        runtime,
+        root_context,
+        initial_request,
+    )
 
 
 if __name__ == "__main__":

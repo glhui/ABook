@@ -65,7 +65,9 @@ ABook/
 |   `-- agent_loop/
 |       |-- context.py         # 共享上下文与 Runtime 状态
 |       |-- workspace_tools.py # 文件、PowerShell 与重试工具
-|       |-- agent_runtime.py   # Agent 创建、Skill 与委派
+|       |-- runner.py          # 统一模型调用、usage 与历史生命周期
+|       |-- orchestration.py   # 父子会话、Skill 与结构化交接
+|       |-- agent_runtime.py   # root Agent 定义和调用入口
 |       `-- main.py            # 实验命令行入口
 |-- .env.example       # 环境变量模板，不包含真实密钥
 |-- AGENTS.md          # 项目编码与协作约束

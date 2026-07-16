@@ -35,7 +35,9 @@
 agent_loop/
 ├─ context.py          共享工作区上下文、AgentContext 和 ContextRuntime
 ├─ workspace_tools.py  文件工具、PowerShell 工具和统一重试边界
-├─ agent_runtime.py    Agent 创建、Skill 选择和子 Agent 委派
+├─ runner.py           root 与子 Agent 共用的模型调用生命周期
+├─ orchestration.py    Skill、父子会话和结构化交接工具
+├─ agent_runtime.py    root Agent 定义和同步/异步调用入口
 ├─ main.py             模型配置与命令行入口
 └─ skills/             可按需加载的 Skill
 ~~~
@@ -58,9 +60,11 @@ WorkspaceContextBuilder 不调用模型、不枚举工作区文件、不读取�
 放入 instructions，并明确项目约束高于 Skill。可变 `TaskState`、证据目录和当前
 请求通过 user message 发送；状态被标记为数据，不能覆盖固定指令或当前请求。
 
-`run_agent` 从当前 `AgentContext.message_history` 读取历史，并在一轮结束后写回
-`AgentRunResult.all_messages()`。因此 root 和 worker 共享工作区事实，但不会
-混用消息历史。每个 Agent 的上下文窗口按 1,000,000 tokens 管理；历史估算达到
+`AgentRunner.run_turn` 是 root、首次委派和继续子会话共用的唯一内部调用管线：
+它依次检查压缩、构造 Runtime user message、设置请求与工具调用上限、调用模型，
+并只在成功后写回消息历史和轮次。`run_agent` 只是 CLI 使用的同步薄适配。因此
+root 和 worker 共享工作区事实，但不会混用消息历史。每个 Agent 的上下文窗口按
+1,000,000 tokens 管理；历史估算达到
 70%（700,000 tokens）时，Runtime 使用同一模型压缩较早消息，保留任务目标、
 约束、决定、修改、验证和未决问题，并尽量保留最近一轮原始消息。模型提供 usage
 时使用真实 token 数，离线模型没有 usage 时才使用字符数估算。压缩输出是结构化
@@ -77,7 +81,7 @@ Runtime 验证 quote 确实存在后，才将其合并为长期 `TaskFact`，后
 
 ## 执行工具
 
-父执行 Agent 当前具有九个核心工具：
+root Agent 当前具有十一个核心工具：
 
 - `list_workspace_files`：递归列出工作区文件，跳过 `.git`、`.venv` 和缓存目录。
 - `read_workspace_file`：读取 UTF-8 文件，超过上限时明确标记截断。
@@ -87,7 +91,9 @@ Runtime 验证 quote 确实存在后，才将其合并为长期 `TaskFact`，后
 - `update_task_state`：更新计划、重要事实、完成条件和任务状态。
 - `select_skill`：根据 manifest 目录按需加载另一个 Skill 的完整正文。
 - `delegate_task`：选择固定模板，创建子 Agent 会话并返回 `session_id`。
-- `continue_subagent`：把验证反馈或后续任务交回同一个子 Agent。
+- `continue_subagent`：把具体反馈和上一轮结构化交接交回同一个子 Agent。
+- `list_subagents`：列出 root 创建的子会话、轮次和最新状态。
+- `inspect_subagent`：读取一个子会话最近的完整结构化交接。
 
 工具通过 `AgentDependencies` 同时获得 `ContextRuntime` 和当前 `AgentContext`。
 工作区工具只读取共享路径；`select_skill` 只修改当前 Agent 的 Skill。所有路径都由宿主解析并验证，
@@ -127,13 +133,19 @@ runtime 的命令边界；因此需要分支或工作区状态时，Agent 应通
 - `reviewer`：只读审查实现、测试和风险。
 
 子 Agent 与父 Agent 引用同一个 `WorkspaceContext`，但拥有独立的 `AgentContext`
-和消息历史，工具集由模板决定。子 Agent 没有 `select_skill`、`delegate_task`
-和 `continue_subagent`，
-因此不能继续创建孙 Agent。首次委派返回的 `session_id` 标识该子 Agent；验证
-失败或需要补充修改时，父 Agent 可调用 `continue_subagent` 并显式传回原消息
-历史。每轮交接包含结构化摘要、已解析证据、实际修改文件、实际验证结果和未决
-问题；其中修改与验证由宿主根据本轮工具调用补入，不能由子 Agent 声称。会话只
-保存在当前父 Agent 运行的内存中，不做持久化、并行调度或跨进程恢复。
+和消息历史，工具集由模板决定。每个子上下文记录唯一 `parent_agent_id`；只有创建
+会话的 root 可以查询或继续它。子 Agent 没有 Skill 选择或任何编排工具，不能创建、
+查询或联系其他子 Agent；它的 Runtime 数据也只展示自己的证据，不展示其他子会话
+交接。首次委派返回的 `session_id` 标识该子 Agent。
+
+每轮交接包含 `completed`、`needs_follow_up` 或 `blocked` 状态，以及结构化摘要、
+带逐字引用的事实、已解析证据、实际修改文件、实际验证结果、未决问题和建议下一
+步。事实使用与 TaskState 相同的 ID + quote 校验；修改与验证由宿主根据本轮工具
+调用补入，不能由子 Agent 声称。`completed` 不允许保留未决事项，其他状态必须
+说明未决事项；Runtime 同时校验父子归属和连续轮次。父 Agent 可先使用查询工具
+检查状态，再通过
+`continue_subagent` 把具体反馈、上一轮状态、未决事项和建议动作交回原子 Agent。
+会话只保存在当前 Runtime 内存中，不做跨进程恢复或子 Agent 间通信。
 
 ## 运行
 
@@ -142,6 +154,12 @@ runtime 的命令边界；因此需要分支或工作区状态时，Agent 应通
 ~~~powershell
 .\.venv\Scripts\python.exe -m experiments.agent_loop.main "解释当前项目"
 ~~~
+
+从仓库根目录执行上述命令即可；`-m` 按 Python 模块启动实验，因此不需要输入
+`experiments\agent_loop\main.py` 脚本路径。省略最后的请求参数时，程序会在终端
+中提示输入首个请求。首轮完成后会持续显示 `You> ` 输入提示，并复用同一个 root
+Agent 的消息历史和 Runtime 状态；输入 `/quit`、`/exit`、`quit` 或 `exit` 结束
+会话。
 
 也可以在 VS Code 中运行 `Debug Agent Loop`，并在集成终端中输入请求。
 
