@@ -3,7 +3,6 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
-import subprocess
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -12,8 +11,6 @@ from pydantic_ai.messages import ModelMessage
 
 
 SKILL_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]*$")
-MAX_REPOSITORY_STATUS_LINES = 50
-GIT_CONTEXT_TIMEOUT_SECONDS = 5
 
 
 class SkillMetadata(BaseModel):
@@ -43,22 +40,12 @@ class ProjectInstruction(BaseModel):
     content: str
 
 
-class RepositoryContext(BaseModel):
-    """进入初始上下文的有界 Git 仓库快照。"""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    is_repository: bool
-    branch: str | None
-    status_lines: tuple[str, ...]
-    status_truncated: bool
-
-
 class WorkspaceContext(BaseModel):
     """所有 Agent 共享的不可变工作区上下文。
 
-    这里只保存运行位置、项目约束和可发现的 Skill。用户任务、当前 Skill 与
-    消息历史属于各自的 AgentContext，避免把全局事实和单个 Agent 状态混在一起。
+    这里只保存运行位置、项目约束和可发现的 Skill。Git 状态等随时间变化的工作区
+    事实必须由工具按需获取；用户任务、当前 Skill 与消息历史属于各自的
+    AgentContext，避免把全局事实和单个 Agent 状态混在一起。
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -67,7 +54,6 @@ class WorkspaceContext(BaseModel):
     working_directory: str
     skills_root: str
     project_instructions: tuple[ProjectInstruction, ...]
-    repository: RepositoryContext
     available_skills: tuple[SkillMetadata, ...]
 
     def render_instructions(self) -> str:
@@ -78,19 +64,6 @@ class WorkspaceContext(BaseModel):
         )
         if not rendered_project_instructions:
             rendered_project_instructions = "未发现适用的 AGENTS.md。"
-
-        if self.repository.is_repository:
-            branch = self.repository.branch or "detached HEAD"
-            repository_status = "\n".join(self.repository.status_lines)
-            if not repository_status:
-                repository_status = "工作区干净。"
-            if self.repository.status_truncated:
-                repository_status += "\n... Git 状态已截断。"
-            rendered_repository = (
-                f"当前分支：{branch}\n工作区状态：\n{repository_status}"
-            )
-        else:
-            rendered_repository = "当前工作区不是 Git 仓库。"
 
         rendered_skill_catalog = "\n".join(
             f"- {metadata.name}: {metadata.description}"
@@ -106,13 +79,20 @@ class WorkspaceContext(BaseModel):
             "## 项目指令\n"
             "以下指令按作用域从宽到窄排列；更接近当前工作目录的指令优先。\n\n"
             f"{rendered_project_instructions}\n\n"
-            f"## Git 快照\n{rendered_repository}\n\n"
             f"## 可用 Skill\n{rendered_skill_catalog}"
         )
 
 
 class ValidationResult(BaseModel):
-    """由宿主命令工具记录的一次验证结果。"""
+    """一次实际运行的验证命令的结果摘要。
+
+    仅当 ``run_powershell_command`` 执行 Python 测试、编译或 ``pip check``
+    时由宿主写入 TaskState，模型不能自行创建此记录。例如，执行
+    ``python -m unittest discover -s tests -v`` 并成功结束时，记录的
+    ``command`` 为该命令、``exit_code`` 为 ``0``、``timed_out`` 为 ``False``。
+    超时的命令没有退出码，因此 ``exit_code`` 为 ``None`` 且 ``timed_out``
+    为 ``True``。
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -362,7 +342,6 @@ class WorkspaceContextBuilder:
             project_instructions=tuple(
                 self._load_project_instructions(resolved_working_directory)
             ),
-            repository=self._inspect_repository(),
             available_skills=self.skill_runtime.discover(),
         )
 
@@ -393,55 +372,3 @@ class WorkspaceContextBuilder:
                 )
             )
         return instructions
-
-    def _inspect_repository(self) -> RepositoryContext:
-        """读取有界 Git 状态；非仓库或未安装 Git 时返回明确空快照。"""
-        repository_check = self._run_git(
-            "rev-parse", "--is-inside-work-tree"
-        )
-        if repository_check is None or repository_check.returncode != 0:
-            return RepositoryContext(
-                is_repository=False,
-                branch=None,
-                status_lines=(),
-                status_truncated=False,
-            )
-
-        branch_result = self._run_git("branch", "--show-current")
-        branch = (
-            branch_result.stdout.strip()
-            if branch_result is not None and branch_result.returncode == 0
-            else None
-        )
-        status_result = self._run_git(
-            "status", "--short", "--untracked-files=normal"
-        )
-        status_lines = (
-            status_result.stdout.splitlines()
-            if status_result is not None and status_result.returncode == 0
-            else []
-        )
-        return RepositoryContext(
-            is_repository=True,
-            branch=branch or None,
-            status_lines=tuple(status_lines[:MAX_REPOSITORY_STATUS_LINES]),
-            status_truncated=len(status_lines) > MAX_REPOSITORY_STATUS_LINES,
-        )
-
-    def _run_git(
-        self, *arguments: str
-    ) -> subprocess.CompletedProcess[str] | None:
-        """运行固定只读 Git 子命令，不接受模型生成的命令文本。"""
-        try:
-            return subprocess.run(
-                ["git", *arguments],
-                cwd=self.workspace_root,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=GIT_CONTEXT_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return None

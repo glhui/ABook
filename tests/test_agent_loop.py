@@ -28,7 +28,6 @@ from experiments.agent_loop.context import (
     AgentDependencies,
     ContextRuntime,
     ProjectInstruction,
-    RepositoryContext,
     SkillMetadata,
     TaskState,
     WorkspaceContext,
@@ -66,12 +65,6 @@ def create_test_runtime(
         working_directory=resolved_workspace_root.as_posix(),
         skills_root=skills_root.as_posix(),
         project_instructions=(),
-        repository=RepositoryContext(
-            is_repository=False,
-            branch=None,
-            status_lines=(),
-            status_truncated=False,
-        ),
         available_skills=(
             SkillMetadata(
                 name="general", description="通用测试 Skill"
@@ -155,7 +148,7 @@ class WorkspaceContextBuilderTests(unittest.TestCase):
                 for metadata in workspace_context.available_skills
             ],
         )
-        self.assertFalse(workspace_context.repository.is_repository)
+        self.assertNotIn("Git 快照", workspace_context.render_instructions())
 
     def test_context_does_not_preload_workspace_files(self) -> None:
         """业务文件必须留给工具按需读取，不能进入初始上下文。"""

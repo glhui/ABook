@@ -12,10 +12,10 @@ ABook 是一个使用 [PydanticAI](https://ai.pydantic.dev/) 构建的命令行�
 - 使用本地 `TestModel` 完成不消耗 API 额度的自动化测试。
 
 仓库顶层的 `experiments/agent_loop/` 还包含一个独立实验：确定性组织工作目录、
-层级 `AGENTS.md`、Git 快照和 Skill 目录作为共享工作区上下文，同时为每个 Agent
-保存独立 Skill 与消息历史，并用结构化 TaskState 跟踪计划、修改文件和验证结果。
-父 Agent 可创建并继续子 Agent 会话，完成工作区发现、修改、验证与审查。该实验
-不属于 `src/abook_agent/` 产品包，不影响当前 CLI。
+层级 `AGENTS.md` 和 Skill 目录作为共享工作区上下文，同时为每个 Agent 保存独立
+Skill 与消息历史，并用结构化 TaskState 跟踪计划、修改文件和验证结果。Git 状态由
+受限工具按需查询。父 Agent 可创建并继续子 Agent 会话，完成工作区发现、修改、
+验证与审查。该实验不属于 `src/abook_agent/` 产品包，不影响当前 CLI。
 
 ## 工作原理
 
