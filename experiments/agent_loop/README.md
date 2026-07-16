@@ -71,6 +71,12 @@ root 和 worker 共享工作区事实，但不会混用消息历史。每个 Age
 检查点：Runtime 先校验并合并事实与未决事项，成功后才用摘要替换旧历史；未知
 证据或工具结果中不存在的引用原文会触发模型重试，原历史不会提前丢弃。
 
+例如，历史中曾读取 `config.py` 并得到 `evidence-8`，其工具结果出现
+`ABOOK_MODEL`。`CompactionCheckpoint.facts` 可以保存“模型名称来自配置”并引用
+该 ID 和逐字 quote `ABOOK_MODEL`；尚未验证的模型连通性则保存到
+`unresolved_issues`。文件全文和重复对话仅由 `summary` 概括，不能被写成已验证
+事实。
+
 `TaskState` 保存当前任务的目标、计划、已完成步骤、重要事实、未决事项、完成
 条件、修改文件、验证结果和总体状态。工作区工具为实际结果登记顺序
 `evidence_id`，同时保存模型实际看到的有界结果文本。root Agent 通过

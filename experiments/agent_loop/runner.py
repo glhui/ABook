@@ -21,14 +21,41 @@ from .context import (
 OutputT = TypeVar("OutputT")
 
 
+
+# 事实性压缩而非简单摘要，保留可验证的 evidence_id 与 quote，避免模型伪造历史
 class CompactionCheckpoint(BaseModel):
-    """压缩旧历史前必须沉淀到宿主状态的结构化检查点。"""
+    """在替换旧消息前交由 Runtime 校验和保存的结构化交接单。
+
+    当某个 Agent 的历史达到上下文阈值时，Runtime 不会直接删除较早消息，而是先让
+    模型从这些消息生成本对象。Runtime 随后校验 ``facts`` 中每个 quote 是否真实
+    出现在对应 ``evidence_id`` 的工具结果中；校验通过后，事实和未决事项会写入
+    ``TaskState``，最后才以 ``summary`` 替换旧历史。校验失败会要求模型重试，旧
+    历史保持不变。
+
+    例如，Agent 曾读取 ``config.py`` 并获得 ``evidence-8``，工具结果包含
+    ``ABOOK_MODEL``。压缩时可记录“模型名称来自 ABOOK_MODEL”这一事实，并引用
+    ``evidence-8`` 和原文 ``ABOOK_MODEL``；如果尚未确认默认模型是否可用，则把
+    该问题放入 ``unresolved_issues``。文件全文和重复对话只进入 ``summary`` 或被
+    丢弃，不应伪造为已验证事实。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    summary: str = Field(min_length=1, max_length=8_000)
-    facts: list[FactClaim] = Field(default_factory=list, max_length=50)
-    unresolved_issues: list[str] = Field(default_factory=list, max_length=50)
+    summary: str = Field(
+        min_length=1,
+        max_length=8_000,
+        description="保留任务进度、关键决定和后续所需背景的简洁历史摘要",
+    )
+    facts: list[FactClaim] = Field(
+        default_factory=list,
+        max_length=50,
+        description="必须带 evidence_id 与逐字 quote 的可验证事实",
+    )
+    unresolved_issues: list[str] = Field(
+        default_factory=list,
+        max_length=50,
+        description="压缩后仍需后续 Agent 处理、验证或向用户澄清的问题",
+    )
 
 
 @dataclass(frozen=True)
