@@ -15,25 +15,31 @@ from pydantic_ai.messages import (
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 
-from experiments.agent_loop.main import (
+from experiments.agent_loop.agent_runtime import (
+    continue_subagent,
+    create_agent,
+    delegate_task,
+    run_agent,
+    select_skill,
+    update_task_state,
+)
+from experiments.agent_loop.context import (
     AgentContext,
     AgentDependencies,
     ContextRuntime,
-    continue_subagent,
-    delegate_task,
     ProjectInstruction,
-    RecoverableToolError,
     RepositoryContext,
     SkillMetadata,
+    TaskState,
     WorkspaceContext,
     WorkspaceContextBuilder,
-    create_agent,
+)
+from experiments.agent_loop.workspace_tools import (
+    RecoverableToolError,
     list_workspace_files,
     read_workspace_file,
     replace_workspace_text,
-    run_agent,
     run_powershell_command,
-    select_skill,
     search_workspace_text,
 )
 
@@ -72,7 +78,7 @@ def create_test_runtime(
             ),
         ),
     )
-    runtime = ContextRuntime(workspace_context)
+    runtime = ContextRuntime(workspace_context, TaskState(goal=task))
     return runtime, runtime.create_agent_context("root", task, "general")
 
 
@@ -171,7 +177,9 @@ class WorkspaceContextBuilderTests(unittest.TestCase):
             self.workspace_root, self.skills_root
         )
 
-        runtime = ContextRuntime(builder.build())
+        runtime = ContextRuntime(
+            builder.build(), TaskState(goal="分析模块")
+        )
         with self.assertRaisesRegex(ValueError, "任务不能为空"):
             runtime.create_agent_context("root", "  ", "general")
 
@@ -220,6 +228,7 @@ class AgentRuntimeTests(unittest.TestCase):
                 "search_workspace_text",
                 "run_powershell_command",
                 "replace_workspace_text",
+                "update_task_state",
                 "select_skill",
                 "delegate_task",
                 "continue_subagent",
@@ -235,7 +244,8 @@ class AgentRuntimeTests(unittest.TestCase):
         )
         self.assertIn("遵守项目约束。", instructions)
         self.assertIn("准确回答用户。", instructions)
-        self.assertNotIn("检查项目", instructions)
+        self.assertIn("目标：检查项目", instructions)
+        self.assertIn("状态：in_progress", instructions)
         self.assertEqual("检查项目", result.all_messages()[0].parts[0].content)
 
     def test_agent_context_keeps_history_between_runs(self) -> None:
@@ -313,6 +323,31 @@ class AgentRuntimeTests(unittest.TestCase):
         )
         self.assertIn("只审查当前修改。", instructions)
         self.assertNotIn("根据工具证据完成任务。", instructions)
+
+    def test_update_task_state_changes_only_model_owned_fields(self) -> None:
+        """root Agent 可更新计划和事实，宿主记录字段保持独立。"""
+        with tempfile.TemporaryDirectory() as workspace_directory:
+            runtime, root_context = create_test_runtime(
+                Path(workspace_directory), task="实现 TaskState"
+            )
+            tool_context = SimpleNamespace(
+                deps=AgentDependencies(runtime, root_context)
+            )
+
+            rendered_state = update_task_state(
+                tool_context,
+                plan=["定义状态", "运行测试"],
+                completed_steps=["分析现状"],
+                important_facts=["TaskState 属于 Runtime"],
+                completion_criteria=["相关测试通过"],
+            )
+
+        self.assertEqual(
+            ["定义状态", "运行测试"], runtime.task_state.plan
+        )
+        self.assertEqual([], runtime.task_state.modified_files)
+        self.assertEqual([], runtime.task_state.validation_results)
+        self.assertIn("TaskState 属于 Runtime", rendered_state)
 
     def test_recoverable_tool_error_returns_to_model_for_new_decision(
         self,
@@ -430,6 +465,10 @@ class WorkspaceToolTests(unittest.TestCase):
         self.assertIn(
             "Changed value", source_path.read_text(encoding="utf-8")
         )
+        self.assertEqual(
+            ["src/app.py"],
+            self.tool_context.deps.runtime.task_state.modified_files,
+        )
 
         with self.assertRaisesRegex(RecoverableToolError, "出现次数"):
             replace_workspace_text(
@@ -454,6 +493,22 @@ class WorkspaceToolTests(unittest.TestCase):
         self.assertEqual(0, result.exit_code)
         self.assertFalse(result.timed_out)
         self.assertIn("src", result.stdout.casefold())
+
+    def test_validation_command_updates_task_state(self) -> None:
+        """实际执行的编译命令由宿主记录到 TaskState。"""
+        result = run_powershell_command(
+            self.tool_context,
+            "python -m compileall -q src",
+        )
+
+        validations = (
+            self.tool_context.deps.runtime.task_state.validation_results
+        )
+        self.assertNotEqual(0, result.exit_code)
+        self.assertEqual(1, len(validations))
+        self.assertEqual("python -m compileall -q src", validations[0].command)
+        self.assertEqual(result.exit_code, validations[0].exit_code)
+        self.assertFalse(validations[0].timed_out)
 
     def test_powershell_tool_rejects_mutating_and_compound_commands(
         self,
@@ -497,7 +552,9 @@ class MultiAgentTests(unittest.TestCase):
         workspace_context = WorkspaceContextBuilder(
             self.workspace_root, self.skills_root
         ).build()
-        self.runtime = ContextRuntime(workspace_context)
+        self.runtime = ContextRuntime(
+            workspace_context, TaskState(goal="父任务")
+        )
         self.root_context = self.runtime.create_agent_context(
             "root", "父任务", "general"
         )

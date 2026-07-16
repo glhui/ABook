@@ -5,7 +5,7 @@
       "name": "Debug Agent Loop",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/experiments/agent_loop/main.py",
+      "module": "experiments.agent_loop.main",
       "python": "${workspaceFolder}/.venv/Scripts/python.exe",
       "console": "integratedTerminal",
       "envFile": "${workspaceFolder}/.env",

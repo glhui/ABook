@@ -16,6 +16,8 @@
              WorkspaceContext  -------- 所有 Agent 共享
                     |
               ContextRuntime
+             TaskState     \
+     goal / plan / facts / validation
                /          \
       root AgentContext   worker AgentContext
       task / skill /      task / skill /
@@ -26,6 +28,17 @@
        +------------+-------------+----------------+-------------+
        |            |             |                |             |
    workspace     replace      PowerShell      select Skill   delegate
+~~~
+
+## 文件职责
+
+~~~text
+agent_loop/
+├─ context.py          共享工作区上下文、AgentContext 和 ContextRuntime
+├─ workspace_tools.py  文件工具、PowerShell 工具和统一重试边界
+├─ agent_runtime.py    Agent 创建、Skill 选择和子 Agent 委派
+├─ main.py             模型配置与命令行入口
+└─ skills/             可按需加载的 Skill
 ~~~
 
 ## 核心边界
@@ -50,15 +63,21 @@ WorkspaceContextBuilder 不调用模型、不枚举工作区文件、不读取�
 `AgentRunResult.all_messages()`。因此 root 和 worker 共享工作区事实，但不会
 混用消息历史。当前实验没有实现历史压缩。
 
+`TaskState` 保存当前任务的目标、计划、已完成步骤、重要事实、完成条件、修改
+文件、验证结果和总体状态。root Agent 通过 `update_task_state` 更新计划性字段；
+文件修改和验证结果只由实际工具调用记录。Runtime 在每次 Agent 运行前将当前
+TaskState 渲染进工作上下文，模型不必只依赖聊天历史恢复任务进度。
+
 ## 执行工具
 
-父执行 Agent 当前具有八个核心工具：
+父执行 Agent 当前具有九个核心工具：
 
 - `list_workspace_files`：递归列出工作区文件，跳过 `.git`、`.venv` 和缓存目录。
 - `read_workspace_file`：读取 UTF-8 文件，超过上限时明确标记截断。
 - `search_workspace_text`：搜索大小写不敏感的字面文本并返回文件和行号。
 - `replace_workspace_text`：校验原文本出现次数后执行精确替换。
 - `run_powershell_command`：运行一条受限的 PowerShell 或 Windows CLI 命令。
+- `update_task_state`：更新计划、重要事实、完成条件和任务状态。
 - `select_skill`：根据 manifest 目录按需加载另一个 Skill 的完整正文。
 - `delegate_task`：选择固定模板，创建子 Agent 会话并返回 `session_id`。
 - `continue_subagent`：把验证反馈或后续任务交回同一个子 Agent。
@@ -67,6 +86,10 @@ WorkspaceContextBuilder 不调用模型、不枚举工作区文件、不读取�
 工作区工具只读取共享路径；`select_skill` 只修改当前 Agent 的 Skill。所有路径都由宿主解析并验证，
 不能通过 `..` 或符号链接越过工作区。结果数量、读取字符数和搜索文件数均有
 上限。`.env` 不会被列出、读取或搜索。
+
+精确替换成功后，Runtime 自动把相对路径加入 `TaskState.modified_files`。Python
+测试、编译和 `pip check` 实际执行后，Runtime 自动记录命令、退出码和超时状态；
+失败结果也会保留，供下一步修正，而不会被模型改写成成功。
 
 路径不存在、越过工作区、替换次数不一致或命令被策略拒绝时，工具只抛出统一的
 `RecoverableToolError`。`RetryToolset` 在工具执行边界将它转换为 PydanticAI
@@ -105,10 +128,10 @@ runtime 的命令边界，并不等同于操作系统级沙箱。
 实验读取仓库根目录 .env 中的 ABOOK_MODEL、ABOOK_API_KEY 和 ABOOK_BASE_URL：
 
 ~~~powershell
-.\.venv\Scripts\python.exe experiments\agent_loop\main.py "解释当前项目"
+.\.venv\Scripts\python.exe -m experiments.agent_loop.main "解释当前项目"
 ~~~
 
-也可以在 VS Code 中运行 main.py，并在集成终端中输入请求。
+也可以在 VS Code 中运行 `Debug Agent Loop`，并在集成终端中输入请求。
 
 ## 当前边界
 
