@@ -131,21 +131,6 @@ ABook 始终通过 PydanticAI 的 `OpenAIChatModel` 和 `OpenAIProvider` 发送�
 
 `.env` 已被 `.gitignore` 忽略，不应提交到版本库。`.env.example` 只能存放明显的占位值。
 
-### DeepSeek 思考模式与工具调用
-
-当 `ABOOK_MODEL` 以 `deepseek` 开头时，实验运行入口会保留函数工具定义，但不会
-在请求中显式发送 `tool_choice`。这是为了兼容 DeepSeek 思考模式：该模式允许模型
-自动调用工具，却会拒绝带有 `tool_choice` 字段的 OpenAI 兼容请求并返回 HTTP 400。
-此兼容行为不需要新增环境变量，也不需要关闭工具或思考模式。
-
-### 工作区 PowerShell 工具被拒绝
-
-实验中的 `run_powershell_command` 只接受一条安全的只读查询或本地验证命令，例如
-`Get-ChildItem -Force`、`rg -n pattern directory`、`git status` 和
-`python -m unittest discover -s tests -v`。它不接受管道、重定向、分号、`cmd /c`、
-绝对路径、安装命令或 Git 写操作。命令被拒绝时，Agent 会收到拒绝原因并应改用
-列目录、读取文件或文本搜索工具；拒绝不会反复消耗该工具的重试次数。
-
 ## 运行 Agent
 
 激活虚拟环境后通过模块入口运行：
@@ -249,3 +234,5 @@ You: 列出知识库里的所有文档。
 ### Agent 没有检索到语义相近的内容
 
 当前实现是关键词匹配，不是向量语义检索。查询中需要包含文档标题或正文中实际出现的关键词。
+
+请先安排一个 explorer 子 Agent 只读分析当前 experiments/agent_loop 中 root Agent、delegate_task 和 continue_subagent 的实现与调用关系，收集具体文件和行号证据；然后由你汇总说明子 Agent 的创建条件、任务来源、会话续接机制，以及当前设计的一个潜在风险。不要修改文件。
