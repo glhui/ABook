@@ -14,8 +14,11 @@ from pydantic_ai.messages import (
     TextPart,
     ToolCallPart,
 )
+from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.tools import ToolDefinition
 
 from experiments.agent_loop.agent_runtime import (
     continue_subagent,
@@ -41,7 +44,10 @@ from experiments.agent_loop.context import (
     WorkspaceContext,
     WorkspaceContextBuilder,
 )
-from experiments.agent_loop.main import run_conversation
+from experiments.agent_loop.main import (
+    DeepSeekThinkingChatModel,
+    run_conversation,
+)
 from experiments.agent_loop.runner import AgentCallLimits, AgentRunner
 from experiments.agent_loop.workspace_tools import (
     RecoverableToolError,
@@ -234,6 +240,35 @@ class WorkspaceContextBuilderTests(unittest.TestCase):
 class AgentRuntimeTests(unittest.TestCase):
     """验证执行 Agent 的工具注册与上下文边界。"""
 
+    def test_deepseek_thinking_model_omits_tool_choice(self) -> None:
+        """DeepSeek 思考模式保留函数工具，但不发送不兼容的 tool_choice。"""
+        model = DeepSeekThinkingChatModel(
+            "deepseek-v4-flash",
+            provider=OpenAIProvider(
+                base_url="https://api.deepseek.example/v1",
+                api_key="test-key",
+            ),
+        )
+        request_parameters = ModelRequestParameters(
+            function_tools=[
+                ToolDefinition(
+                    name="read_workspace_file",
+                    description="读取文件",
+                    parameters_json_schema={
+                        "type": "object",
+                        "properties": {},
+                    },
+                )
+            ]
+        )
+
+        tools, tool_choice = model._get_tool_choice(
+            {}, request_parameters
+        )
+
+        self.assertEqual(1, len(tools))
+        self.assertIsNone(tool_choice)
+
     def test_agent_registers_core_workspace_tools(self) -> None:
         """模型收到工作区和编排工具，同时用户请求仍是独立消息。"""
         model = TestModel(call_tools=[], custom_output_text="最终回答")
@@ -359,7 +394,9 @@ class AgentRuntimeTests(unittest.TestCase):
         serialized_history = ModelMessagesTypeAdapter.dump_json(
             root_context.message_history
         ).decode()
-        self.assertEqual(["持续回答", "持续回答"], outputs)
+        self.assertEqual(
+            ["Assistant> 持续回答", "Assistant> 持续回答"], outputs
+        )
         self.assertEqual(2, root_context.turn_count)
         self.assertIn("## 当前请求\\n第一轮", serialized_history)
         self.assertIn("## 当前请求\\n第二轮", serialized_history)
@@ -718,6 +755,121 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(1, len(retry_parts))
         self.assertIn("missing.txt", retry_parts[0].content)
         self.assertEqual(2, result.usage.requests)
+
+    def test_read_file_accepts_file_path_compatibility_field(self) -> None:
+        """常见的 file_path 字段可读取文件，不消耗参数校验重试次数。"""
+        model_call_count = 0
+
+        def model_function(_messages, _agent_info):
+            nonlocal model_call_count
+            model_call_count += 1
+            if model_call_count == 1:
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name="read_workspace_file",
+                            args={
+                                "file_path": "note.txt",
+                                "max_characters": 100,
+                            },
+                        )
+                    ]
+                )
+            return ModelResponse(parts=[TextPart("已读取兼容路径")])
+
+        with tempfile.TemporaryDirectory() as workspace_directory:
+            workspace_root = Path(workspace_directory).resolve()
+            (workspace_root / "note.txt").write_text(
+                "兼容字段内容", encoding="utf-8"
+            )
+            runtime, root_context = create_test_runtime(workspace_root)
+            result = run_agent(
+                create_agent(FunctionModel(model_function)),
+                runtime,
+                root_context,
+            )
+
+        self.assertEqual("已读取兼容路径", result.output)
+        self.assertEqual(2, result.usage.requests)
+        self.assertEqual(1, result.usage.tool_calls)
+
+    def test_missing_read_path_is_a_recoverable_tool_error(self) -> None:
+        """漏传路径时返回明确反馈，避免直接耗尽工具参数校验重试。"""
+        def model_function(messages, _agent_info):
+            has_retry = any(
+                isinstance(part, RetryPromptPart)
+                for message in messages
+                for part in message.parts
+            )
+            if has_retry:
+                return ModelResponse(parts=[TextPart("已补充读取参数")])
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="read_workspace_file", args={}
+                    )
+                ]
+            )
+
+        with tempfile.TemporaryDirectory() as workspace_directory:
+            runtime, root_context = create_test_runtime(
+                Path(workspace_directory).resolve()
+            )
+            result = run_agent(
+                create_agent(FunctionModel(model_function)),
+                runtime,
+                root_context,
+            )
+
+        retry_parts = [
+            part
+            for message in result.all_messages()
+            for part in message.parts
+            if isinstance(part, RetryPromptPart)
+        ]
+        self.assertEqual("已补充读取参数", result.output)
+        self.assertEqual(1, len(retry_parts))
+        self.assertIn("必须提供 path", retry_parts[0].content)
+
+    def test_rejected_powershell_command_returns_to_model_without_retry(
+        self,
+    ) -> None:
+        """安全策略拒绝命令后，模型可改用其他决策而不耗尽工具重试。"""
+        model_call_count = 0
+
+        def model_function(_messages, _agent_info):
+            nonlocal model_call_count
+            model_call_count += 1
+            if model_call_count == 1:
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name="run_powershell_command",
+                            args={"command": "Get-ChildItem | Measure-Object"},
+                        )
+                    ]
+                )
+            return ModelResponse(parts=[TextPart("已改用安全工具")])
+
+        with tempfile.TemporaryDirectory() as workspace_directory:
+            runtime, root_context = create_test_runtime(
+                Path(workspace_directory).resolve()
+            )
+            result = run_agent(
+                create_agent(FunctionModel(model_function)),
+                runtime,
+                root_context,
+            )
+
+        retry_parts = [
+            part
+            for message in result.all_messages()
+            for part in message.parts
+            if isinstance(part, RetryPromptPart)
+        ]
+        self.assertEqual("已改用安全工具", result.output)
+        self.assertEqual(1, result.usage.tool_calls)
+        self.assertEqual([], retry_parts)
 
 
 class WorkspaceToolTests(unittest.TestCase):

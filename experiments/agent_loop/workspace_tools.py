@@ -85,7 +85,13 @@ class RecoverableToolError(Exception):
 
 
 class RetryToolset(WrapperToolset[AgentDependencies]):
-    """在单一边界把业务可恢复错误转换为 PydanticAI 重试信号。"""
+    """在单一边界处理业务可恢复错误与命令策略拒绝。
+
+    大多数可恢复错误会转换为 ``ModelRetry``，让模型修正参数。受限
+    PowerShell 命令则是例外：模型若重复同一条被安全策略拒绝的命令，重试没有
+    价值，只会耗尽 PydanticAI 的工具重试预算。因此此类错误会作为普通工具结果
+    返回，提示模型改用文件、搜索或目录工具。
+    """
 
     async def call_tool(
         self,
@@ -98,6 +104,12 @@ class RetryToolset(WrapperToolset[AgentDependencies]):
         try:
             return await self.wrapped.call_tool(name, tool_args, ctx, tool)
         except RecoverableToolError as error:
+            if name == "run_powershell_command":
+                return (
+                    f"Command rejected by workspace policy: {error}. "
+                    "Do not retry this command. Use list_workspace_files, "
+                    "read_workspace_file, or search_workspace_text when possible."
+                )
             raise ModelRetry(str(error)) from error
 
 
@@ -202,13 +214,19 @@ def list_workspace_files(
 def read_workspace_file(
     ctx: RunContext[AgentDependencies],
     path: Annotated[
-        str,
+        str | None,
         Field(
-            min_length=1,
             max_length=500,
-            description="工作区根目录下要读取的 UTF-8 文件相对路径",
+            description="工作区根目录下要读取的 UTF-8 文件相对路径；优先使用此字段",
         ),
-    ],
+    ] = None,
+    file_path: Annotated[
+        str | None,
+        Field(
+            max_length=500,
+            description="兼容字段；仅当 path 未提供时使用，值同样必须是相对路径",
+        ),
+    ] = None,
     max_characters: Annotated[
         int,
         Field(
@@ -218,8 +236,25 @@ def read_workspace_file(
         ),
     ] = 10_000,
 ) -> str:
-    """读取 UTF-8 工作区文件；无效路径会反馈给模型重新选择。"""
-    resolved_path = _resolve_workspace_path(ctx.deps.workspace_root, path)
+    """读取 UTF-8 工作区文件；无效路径会反馈给模型重新选择。
+
+    ``path`` 是正式参数。``file_path`` 仅兼容部分模型常用的字段名，避免因
+    参数名差异消耗有限的工具重试次数；两个字段同时给出且内容不一致时会要求
+    模型重新选择唯一文件。两者均未提供时也返回可恢复错误，而非让参数校验直接
+    中止整轮 Agent 调用。
+    """
+    if path is not None and file_path is not None and path != file_path:
+        raise RecoverableToolError(
+            "path 与 file_path 不能指向不同文件；请只提供 path。"
+        )
+    requested_path = path or file_path
+    if not requested_path:
+        raise RecoverableToolError(
+            "必须提供 path；例如 path='experiments/agent_loop/runner.py'。"
+        )
+    resolved_path = _resolve_workspace_path(
+        ctx.deps.workspace_root, requested_path
+    )
     if not resolved_path.is_file():
         raise RecoverableToolError("path 必须指向工作区文件")
     try:
@@ -552,7 +587,11 @@ def run_powershell_command(
     """运行受限的查询、Git 检查或本地验证命令。
 
     该工具不允许安装依赖、网络访问、Git 写操作或任意 PowerShell 复合语法。
-    Python 测试和编译可能在工作区产生常规缓存文件。
+    Python 测试和编译可能在工作区产生常规缓存文件。常用安全调用包括
+    ``Get-ChildItem -Force``、``rg -n pattern directory``、``git status`` 和
+    ``python -m unittest discover -s tests -v``；不要使用管道、分号、重定向、
+    ``cmd /c`` 或绝对路径。策略拒绝会作为工具结果返回，调用者应改用文件工具
+    或另一条符合规则的单命令，而不是原样重试。
     """
     arguments = _validate_powershell_command(command)
     is_validation = _is_validation_command(arguments)
