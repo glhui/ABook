@@ -14,8 +14,9 @@ ABook 是一个使用 [PydanticAI](https://ai.pydantic.dev/) 构建的命令行�
 仓库顶层的 `experiments/agent_loop/` 还包含一个独立实验：确定性组织工作目录、
 层级 `AGENTS.md` 和 Skill 目录作为共享工作区上下文，同时为每个 Agent 保存独立
 Skill 与消息历史，并用结构化 TaskState 跟踪计划、修改文件和验证结果。Git 状态由
-受限工具按需查询。父 Agent 可创建并继续子 Agent 会话，完成工作区发现、修改、
-验证与审查。每个 Agent 的一百万 token 上下文达到 70% 时自动压缩旧历史；工具
+受限工具按需查询。协调 Agent 可像项目经理一样拆分并分配工作包，任务 Agent
+完成交接后会自动触发协调 Agent 重新规划。每个 Agent 的一百万 token
+上下文达到 70% 时自动压缩旧历史；工具
 结果使用证据 ID 和逐字摘录关联任务事实，压缩前会先生成结构化状态检查点。
 固定项目指令与可变 Runtime 状态使用不同消息层级。该实验不属于
 `src/abook_agent/` 产品包，不影响当前 CLI。
@@ -66,8 +67,8 @@ ABook/
 |       |-- context.py         # 共享上下文与 Runtime 状态
 |       |-- workspace_tools.py # 文件、PowerShell 与重试工具
 |       |-- runner.py          # 统一模型调用、usage 与历史生命周期
-|       |-- orchestration.py   # 父子会话、Skill 与结构化交接
-|       |-- agent_runtime.py   # root Agent 定义和调用入口
+|       |-- orchestration.py   # 任务分配、Skill 与结构化交接
+|       |-- agent_runtime.py   # 协调 Agent 定义和调用入口
 |       `-- main.py            # 实验命令行入口
 |-- .env.example       # 环境变量模板，不包含真实密钥
 |-- AGENTS.md          # 项目编码与协作约束
@@ -234,5 +235,3 @@ You: 列出知识库里的所有文档。
 ### Agent 没有检索到语义相近的内容
 
 当前实现是关键词匹配，不是向量语义检索。查询中需要包含文档标题或正文中实际出现的关键词。
-
-请先安排一个 explorer 子 Agent 只读分析当前 experiments/agent_loop 中 root Agent、delegate_task 和 continue_subagent 的实现与调用关系，收集具体文件和行号证据；然后由你汇总说明子 Agent 的创建条件、任务来源、会话续接机制，以及当前设计的一个潜在风险。不要修改文件。

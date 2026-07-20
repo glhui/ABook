@@ -1,9 +1,12 @@
 """构建共享工作区上下文，并保存每个 Agent 的私有运行状态。"""
 
+import asyncio
 from dataclasses import dataclass, field
+from _thread import LockType
 from pathlib import Path
 import re
-from typing import Literal
+from threading import Lock
+from typing import Awaitable, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import Agent
@@ -164,14 +167,14 @@ class TaskFact(BaseModel):
     evidence: tuple[EvidenceCitation, ...]
 
 
-class SubagentHandoff(BaseModel):
-    """由宿主保存、供父 Agent 后续查询的结构化子 Agent 交接。"""
+class TaskHandoff(BaseModel):
+    """任务 Agent 完成一轮工作后，由 Runtime 保存的结构化交接。"""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    session_id: str
-    parent_agent_id: str
-    child_agent_id: str
+    assignment_id: str
+    coordinator_id: str
+    agent_id: str
     template: str
     skill: str
     turn_index: int
@@ -186,6 +189,34 @@ class SubagentHandoff(BaseModel):
     compacted: bool
     model_requests: int
     tool_calls: int
+
+
+@dataclass(frozen=True)
+class AgentCallEvent:
+    """一次 Agent 调用在宿主侧产生的生命周期通知。
+
+    Runtime 在调用开始以及成功或失败结束时同步发送该事件。事件只描述调用边界，
+    不包含模型的逐 token 输出，因此 CLI 可以及时显示进度，同时保持现有的非流式
+    最终回答接口。
+    """
+
+    call_id: int
+    agent_id: str
+    kind: Literal["agent", "compaction"]
+    phase: Literal["started", "completed", "failed"]
+    turn_index: int
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
+class AssignmentCompletionEvent:
+    """后台任务分配结束后发送给协调 Agent 的完成或失败通知。"""
+
+    assignment_id: str
+    coordinator_id: str
+    status: Literal["completed", "needs_follow_up", "blocked", "failed"]
+    handoff: TaskHandoff | None = None
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -236,7 +267,7 @@ class ContextWindowPolicy:
 class TaskState:
     """当前任务的结构化工作状态。
 
-    计划、事实和完成条件由 root Agent 显式更新；修改文件和验证结果由实际工具
+    计划、事实和完成条件由协调 Agent 显式更新；修改文件和验证结果由实际工具
     调用确定性记录，避免模型把未发生的操作写成已经完成的事实。
     """
 
@@ -352,28 +383,38 @@ class AgentContext:
 
     历史达到窗口阈值后，Runtime 将较早消息替换为 ``conversation_summary``，
     ``compaction_count`` 用于区分原始历史与已经发生过压缩的会话。
+    ``role`` 只表达当前职责和工具范围，不代表类继承关系。
     """
 
     agent_id: str
     task: str
     skill: Skill
-    parent_agent_id: str | None = None
+    role: Literal["coordinator", "task"] = "coordinator"
+    coordinator_id: str | None = None
     message_history: list[ModelMessage] = field(default_factory=list)
     conversation_summary: str | None = None
     compaction_count: int = 0
     turn_count: int = 0
+    run_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
 @dataclass
-class AgentSession:
-    """保存父 Agent 独占、可继续调用的子 Agent 会话。"""
+class AssignmentSession:
+    """保存协调 Agent 发出的、可在后台运行和继续处理的任务分配。"""
 
-    session_id: str
-    parent_agent_id: str
-    child_agent_id: str
+    assignment_id: str
+    coordinator_id: str
+    agent_id: str
     template: str
     agent: Agent
-    latest_handoff: SubagentHandoff | None = None
+    status: Literal[
+        "running", "completed", "needs_follow_up", "blocked", "failed"
+    ] = "running"
+    latest_handoff: TaskHandoff | None = None
+    error: str | None = None
+    background_task: asyncio.Task[None] | None = field(
+        default=None, repr=False
+    )
 
 
 class SkillRuntime:
@@ -425,7 +466,7 @@ class ContextRuntime:
     """持有共享工作区上下文，并为每个 Agent 保存独立上下文。
 
     Runtime 不让模型维护这份结构。它只负责确定性地创建 AgentContext、组合
-    全局指令与当前 Skill，并保存可继续调用的子 Agent 会话。
+    全局指令与当前 Skill，并保存可继续处理的任务分配会话。
     """
 
     workspace: WorkspaceContext
@@ -434,16 +475,27 @@ class ContextRuntime:
         default_factory=ContextWindowPolicy
     )
     agent_contexts: dict[str, AgentContext] = field(default_factory=dict)
-    subagents: dict[str, AgentSession] = field(default_factory=dict)
+    assignments: dict[str, AssignmentSession] = field(default_factory=dict)
     evidence_records: dict[str, EvidenceRecord] = field(default_factory=dict)
-    handoff_history: list[SubagentHandoff] = field(default_factory=list)
+    assignment_history: list[TaskHandoff] = field(default_factory=list)
+    call_event_handler: Callable[[AgentCallEvent], None] | None = None
+    assignment_completion_handler: (
+        Callable[[AssignmentCompletionEvent], Awaitable[None]] | None
+    ) = None
+    modified_files_by_agent: dict[str, list[str]] = field(default_factory=dict)
+    validation_results_by_agent: dict[str, list[ValidationResult]] = field(
+        default_factory=dict
+    )
+    _next_call_id: int = 1
+    _state_lock: LockType = field(default_factory=Lock, repr=False)
 
     def create_agent_context(
         self,
         agent_id: str,
         task: str,
         skill_id: str,
-        parent_agent_id: str | None = None,
+        role: Literal["coordinator", "task"] = "coordinator",
+        coordinator_id: str | None = None,
     ) -> AgentContext:
         """创建并登记一个 Agent 私有上下文。"""
         normalized_task = task.strip()
@@ -451,17 +503,19 @@ class ContextRuntime:
             raise ValueError("任务不能为空")
         if agent_id in self.agent_contexts:
             raise ValueError(f"Agent 上下文已存在：{agent_id}")
-        if (
-            parent_agent_id is not None
-            and parent_agent_id not in self.agent_contexts
-        ):
-            raise ValueError(f"父 Agent 上下文不存在：{parent_agent_id}")
+        if role == "coordinator" and coordinator_id is not None:
+            raise ValueError("协调 Agent 不能再指定 coordinator_id")
+        if role == "task":
+            coordinator = self.agent_contexts.get(coordinator_id or "")
+            if coordinator is None or coordinator.role != "coordinator":
+                raise ValueError(f"协调 Agent 上下文不存在：{coordinator_id}")
         skill = SkillRuntime(Path(self.workspace.skills_root)).load(skill_id)
         agent_context = AgentContext(
             agent_id=agent_id,
             task=normalized_task,
             skill=skill,
-            parent_agent_id=parent_agent_id,
+            role=role,
+            coordinator_id=coordinator_id,
         )
         self.agent_contexts[agent_id] = agent_context
         return agent_context
@@ -479,23 +533,23 @@ class ContextRuntime:
 
     def render_runtime_state(self, agent_context: AgentContext) -> str:
         """按调用 Agent 的可见范围渲染可变状态数据。"""
-        is_root = agent_context.parent_agent_id is None
+        is_coordinator = agent_context.role == "coordinator"
         evidence_catalog = "\n".join(
             f"- {record.evidence_id}: agent={record.agent_id}; "
             f"kind={record.kind}; source={record.source}; {record.detail}"
             for record in self.evidence_records.values()
-            if is_root or record.agent_id == agent_context.agent_id
+            if is_coordinator or record.agent_id == agent_context.agent_id
         ) or "- 无"
         handoff_catalog = "\n".join(
-            f"- {handoff.session_id} turn={handoff.turn_index} "
+            f"- {handoff.assignment_id} turn={handoff.turn_index} "
             f"status={handoff.status}: {handoff.summary}"
-            for handoff in self.handoff_history
-            if is_root and handoff.parent_agent_id == agent_context.agent_id
+            for handoff in self.assignment_history
+            if is_coordinator and handoff.coordinator_id == agent_context.agent_id
         ) or "- 无"
         return (
             f"{self.task_state.render()}\n\n"
             f"证据目录：\n{evidence_catalog}\n\n"
-            f"子 Agent 交接记录：\n{handoff_catalog}"
+            f"任务交接记录：\n{handoff_catalog}"
         )
 
     def build_user_prompt(
@@ -510,27 +564,60 @@ class ContextRuntime:
             f"{request}"
         )
 
-    def next_subagent_id(self, template: str) -> str:
-        """生成不会与失败调用留下的 AgentContext 冲突的子 Agent ID。"""
+    def next_assignment_id(self, template: str) -> str:
+        """生成不会与既有上下文或任务分配冲突的 ID。"""
         index = 1
         while (
             f"{template}-{index}" in self.agent_contexts
-            or f"{template}-{index}" in self.subagents
+            or f"{template}-{index}" in self.assignments
         ):
             index += 1
         return f"{template}-{index}"
 
-    def record_handoff(self, handoff: SubagentHandoff) -> None:
-        """保存子 Agent 一轮交接，并同步对应会话的最新状态。"""
-        session = self.subagents.get(handoff.session_id)
+    def next_call_id(self) -> int:
+        """分配用于关联开始与结束通知的 Runtime 内顺序调用 ID。"""
+        with self._state_lock:
+            call_id = self._next_call_id
+            self._next_call_id += 1
+        return call_id
+
+    def emit_call_event(self, event: AgentCallEvent) -> None:
+        """把调用生命周期事件同步交给可选宿主处理器。"""
+        if self.call_event_handler is not None:
+            self.call_event_handler(event)
+
+    def record_modified_file(self, path: str, agent_id: str) -> None:
+        """同时记录全局修改状态和执行该修改的 Agent，供并行交接归属。"""
+        with self._state_lock:
+            self.task_state.record_modified_file(path)
+            self.modified_files_by_agent.setdefault(agent_id, []).append(path)
+
+    def record_validation(
+        self,
+        command: str,
+        exit_code: int | None,
+        timed_out: bool,
+        agent_id: str,
+    ) -> None:
+        """同时记录全局验证状态和执行该验证的 Agent。"""
+        with self._state_lock:
+            self.task_state.record_validation(command, exit_code, timed_out)
+            result = self.task_state.validation_results[-1]
+            self.validation_results_by_agent.setdefault(agent_id, []).append(
+                result
+            )
+
+    def record_handoff(self, handoff: TaskHandoff) -> None:
+        """保存任务 Agent 的一轮交接，并同步任务分配的最新状态。"""
+        session = self.assignments.get(handoff.assignment_id)
         if session is None:
-            raise ValueError(f"未知子 Agent 会话：{handoff.session_id}")
+            raise ValueError(f"未知任务分配：{handoff.assignment_id}")
         if (
-            handoff.parent_agent_id != session.parent_agent_id
-            or handoff.child_agent_id != session.child_agent_id
+            handoff.coordinator_id != session.coordinator_id
+            or handoff.agent_id != session.agent_id
             or handoff.template != session.template
         ):
-            raise ValueError("子 Agent 交接与会话归属不一致")
+            raise ValueError("任务交接与分配归属不一致")
         expected_turn = (
             session.latest_handoff.turn_index + 1
             if session.latest_handoff is not None
@@ -538,11 +625,13 @@ class ContextRuntime:
         )
         if handoff.turn_index != expected_turn:
             raise ValueError(
-                "子 Agent 交接轮次不连续："
+                "任务交接轮次不连续："
                 f"expected={expected_turn}, actual={handoff.turn_index}"
             )
         session.latest_handoff = handoff
-        self.handoff_history.append(handoff)
+        session.status = handoff.status
+        session.error = None
+        self.assignment_history.append(handoff)
 
     def register_evidence(
         self,
@@ -559,16 +648,17 @@ class ContextRuntime:
         agent_id: str,
     ) -> EvidenceRecord:
         """登记一次实际工具结果，并将顺序 ID 绑定到调用 Agent。"""
-        evidence_id = f"evidence-{len(self.evidence_records) + 1}"
-        evidence = EvidenceRecord(
-            evidence_id=evidence_id,
-            agent_id=agent_id,
-            kind=kind,
-            source=source,
-            detail=detail,
-            content=content,
-        )
-        self.evidence_records[evidence_id] = evidence
+        with self._state_lock:
+            evidence_id = f"evidence-{len(self.evidence_records) + 1}"
+            evidence = EvidenceRecord(
+                evidence_id=evidence_id,
+                agent_id=agent_id,
+                kind=kind,
+                source=source,
+                detail=detail,
+                content=content,
+            )
+            self.evidence_records[evidence_id] = evidence
         return evidence
 
     def resolve_fact_claims(
@@ -650,7 +740,7 @@ class WorkspaceContextBuilder:
         self,
         working_directory: Path | None = None,
     ) -> WorkspaceContext:
-        """构建当前父任务内所有 Agent 共享的工作区上下文。
+        """构建当前整体目标内所有 Agent 共享的工作区上下文。
 
         Args:
             working_directory: 当前任务目录，默认使用工作区根目录。

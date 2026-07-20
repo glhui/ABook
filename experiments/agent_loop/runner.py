@@ -1,6 +1,5 @@
-"""统一执行 root 与子 Agent 的一轮模型调用和上下文生命周期。"""
+"""统一执行协调 Agent 与任务 Agent 的模型调用和上下文生命周期。"""
 
-import asyncio
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
@@ -11,6 +10,7 @@ from pydantic_ai.models import Model
 from pydantic_ai.usage import RunUsage, UsageLimits
 
 from .context import (
+    AgentCallEvent,
     AgentContext,
     AgentDependencies,
     ContextRuntime,
@@ -84,8 +84,8 @@ class AgentTurnResult(Generic[OutputT]):
     原始结果，供现有 CLI 或需要访问完整 usage 的调用方继续使用。
 
     Attributes:
-        output: 模型的最终输出。root Agent 通常是 ``str``，子 Agent 通常是结构化
-            ``SubagentReport``。
+        output: 模型的最终输出。协调 Agent 通常是 ``str``，任务 Agent 通常是
+            结构化 ``TaskReport``。
         messages: 本轮结束后的完整私有消息历史，包含此前历史、本轮 user message、
             模型响应和工具调用结果；不会包含其他 Agent 的私有历史。
         requests: 本轮消耗的全部模型请求数，包含主 Agent 调用和压缩调用。
@@ -96,8 +96,8 @@ class AgentTurnResult(Generic[OutputT]):
         compacted: 本轮主 Agent 调用前是否发生过历史压缩。
         compaction_requests: ``requests`` 中属于压缩检查点的模型请求数；未压缩时为
             ``0``，通常为 ``1``，但模型需要修正无效证据引用时可能大于 ``1``。
-        turn_index: 当前 Agent 私有会话的成功轮次，从 ``1`` 开始；root 的第 4 次
-            请求和某个 worker 的第 4 次请求各自都可为 ``4``。
+        turn_index: 当前 Agent 私有会话的成功轮次，从 ``1`` 开始；协调 Agent 和
+            某个 worker 的第 4 次请求各自都可为 ``4``。
         raw_result: PydanticAI 返回的 ``AgentRunResult``，用于访问框架原始数据。
 
     例如，worker 已完成 3 轮，第四轮开始前压缩旧历史。压缩模型请求 1 次，主
@@ -141,28 +141,65 @@ class AgentRunner:
         agent_context: AgentContext,
         request: str,
     ) -> AgentTurnResult[OutputT]:
+        """串行化同一 AgentContext 的调用，避免后台续跑破坏消息历史。"""
+        async with agent_context.run_lock:
+            return await self._run_turn_locked(
+                agent, runtime, agent_context, request
+            )
+
+    async def _run_turn_locked(
+        self,
+        agent: Agent[AgentDependencies, OutputT],
+        runtime: ContextRuntime,
+        agent_context: AgentContext,
+        request: str,
+    ) -> AgentTurnResult[OutputT]:
         """执行一轮调用，并只在成功后写回该 Agent 的消息历史。"""
         normalized_request = request.strip()
         if not normalized_request:
             raise ValueError("请求不能为空")
 
-        compaction_usage = await self._compact_history(
-            agent, runtime, agent_context
+        call_id = runtime.next_call_id()
+        turn_index = agent_context.turn_count + 1
+        runtime.emit_call_event(
+            AgentCallEvent(
+                call_id=call_id,
+                agent_id=agent_context.agent_id,
+                kind="agent",
+                phase="started",
+                turn_index=turn_index,
+            )
         )
-        result = await agent.run(
-            runtime.build_user_prompt(agent_context, normalized_request),
-            deps=AgentDependencies(runtime, agent_context),
-            message_history=agent_context.message_history,
-            usage_limits=UsageLimits(
-                request_limit=self.limits.request_limit,
-                tool_calls_limit=self.limits.tool_calls_limit,
-            ),
-        )
+        try:
+            compaction_usage = await self._compact_history(
+                agent, runtime, agent_context
+            )
+            result = await agent.run(
+                runtime.build_user_prompt(agent_context, normalized_request),
+                deps=AgentDependencies(runtime, agent_context),
+                message_history=agent_context.message_history,
+                usage_limits=UsageLimits(
+                    request_limit=self.limits.request_limit,
+                    tool_calls_limit=self.limits.tool_calls_limit,
+                ),
+            )
+        except Exception as error:
+            runtime.emit_call_event(
+                AgentCallEvent(
+                    call_id=call_id,
+                    agent_id=agent_context.agent_id,
+                    kind="agent",
+                    phase="failed",
+                    turn_index=turn_index,
+                    detail=f"{type(error).__name__}: {error}",
+                )
+            )
+            raise
         messages = result.all_messages()
         agent_context.message_history = messages
         agent_context.turn_count += 1
         usage = result.usage
-        return AgentTurnResult(
+        turn_result = AgentTurnResult(
             output=result.output,
             messages=messages,
             requests=(
@@ -188,24 +225,20 @@ class AgentRunner:
             turn_index=agent_context.turn_count,
             raw_result=result,
         )
-
-    def run_turn_sync(
-        self,
-        agent: Agent[AgentDependencies, OutputT],
-        runtime: ContextRuntime,
-        agent_context: AgentContext,
-        request: str,
-    ) -> AgentTurnResult[OutputT]:
-        """在非异步入口运行统一 async 管线；活动事件循环中应直接 await。"""
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return asyncio.run(
-                self.run_turn(agent, runtime, agent_context, request)
+        runtime.emit_call_event(
+            AgentCallEvent(
+                call_id=call_id,
+                agent_id=agent_context.agent_id,
+                kind="agent",
+                phase="completed",
+                turn_index=turn_index,
+                detail=(
+                    f"requests={turn_result.requests}; "
+                    f"tool_calls={turn_result.tool_calls}"
+                ),
             )
-        raise RuntimeError(
-            "活动事件循环中不能调用 run_turn_sync；请 await run_turn"
         )
+        return turn_result
 
     async def _compact_history(
         self,
@@ -227,17 +260,50 @@ class AgentRunner:
             retained_messages = []
 
         checkpoint_agent = _create_compaction_agent(agent.model)
-        result = await checkpoint_agent.run(
-            "压缩以上历史，以便原 Agent 继续当前任务。",
-            deps=AgentDependencies(runtime, agent_context),
-            message_history=compacted_messages,
-            usage_limits=UsageLimits(
-                request_limit=self.limits.compaction_request_limit,
-                tool_calls_limit=1,
-            ),
+        call_id = runtime.next_call_id()
+        runtime.emit_call_event(
+            AgentCallEvent(
+                call_id=call_id,
+                agent_id=agent_context.agent_id,
+                kind="compaction",
+                phase="started",
+                turn_index=agent_context.turn_count + 1,
+            )
         )
+        try:
+            result = await checkpoint_agent.run(
+                "压缩以上历史，以便原 Agent 继续当前任务。",
+                deps=AgentDependencies(runtime, agent_context),
+                message_history=compacted_messages,
+                usage_limits=UsageLimits(
+                    request_limit=self.limits.compaction_request_limit,
+                    tool_calls_limit=1,
+                ),
+            )
+        except Exception as error:
+            runtime.emit_call_event(
+                AgentCallEvent(
+                    call_id=call_id,
+                    agent_id=agent_context.agent_id,
+                    kind="compaction",
+                    phase="failed",
+                    turn_index=agent_context.turn_count + 1,
+                    detail=f"{type(error).__name__}: {error}",
+                )
+            )
+            raise
         _apply_checkpoint(
             runtime, agent_context, result.output, retained_messages
+        )
+        runtime.emit_call_event(
+            AgentCallEvent(
+                call_id=call_id,
+                agent_id=agent_context.agent_id,
+                kind="compaction",
+                phase="completed",
+                turn_index=agent_context.turn_count + 1,
+                detail=f"requests={result.usage.requests}",
+            )
         )
         return result.usage
 

@@ -440,7 +440,9 @@ def replace_workspace_text(
     relative_path = resolved_path.relative_to(
         ctx.deps.workspace_root
     ).as_posix()
-    ctx.deps.runtime.task_state.record_modified_file(relative_path)
+    ctx.deps.runtime.record_modified_file(
+        relative_path, ctx.deps.agent_context.agent_id
+    )
     evidence = ctx.deps.runtime.register_evidence(
         "file_change",
         relative_path,
@@ -627,10 +629,11 @@ def run_powershell_command(
         )
     except subprocess.TimeoutExpired as error:
         if is_validation:
-            ctx.deps.runtime.task_state.record_validation(
+            ctx.deps.runtime.record_validation(
                 command=command,
                 exit_code=None,
                 timed_out=True,
+                agent_id=ctx.deps.agent_context.agent_id,
             )
         stdout = _truncate_command_output(error.stdout)
         stderr = _truncate_command_output(error.stderr)
@@ -655,10 +658,11 @@ def run_powershell_command(
         )
 
     if is_validation:
-        ctx.deps.runtime.task_state.record_validation(
+        ctx.deps.runtime.record_validation(
             command=command,
             exit_code=completed_process.returncode,
             timed_out=False,
+            agent_id=ctx.deps.agent_context.agent_id,
         )
     relative_working_directory = command_working_directory.relative_to(
         ctx.deps.workspace_root

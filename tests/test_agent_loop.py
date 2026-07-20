@@ -2,10 +2,12 @@
 
 import asyncio
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 import tempfile
 import unittest
 
+from pydantic_ai import Agent, AgentRunResult
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import (
     ModelMessagesTypeAdapter,
@@ -21,14 +23,14 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.tools import ToolDefinition
 
 from experiments.agent_loop.agent_runtime import (
-    continue_subagent,
-    create_agent,
-    delegate_task,
-    inspect_subagent,
-    list_subagents,
-    run_agent,
-    run_agent_turn,
+    TaskAssignmentRequest,
+    assign_tasks,
+    create_coordinator_agent,
+    inspect_assignment,
+    list_assignments,
+    run_coordinator_turn,
     select_skill,
+    send_task_feedback,
     update_task_state,
 )
 from experiments.agent_loop.context import (
@@ -64,7 +66,7 @@ def create_test_runtime(
     task: str = "测试任务",
     skill_content: str = "根据工具证据完成任务。",
 ) -> tuple[ContextRuntime, AgentContext]:
-    """创建带 general Skill 的最小 Runtime 和 root AgentContext。"""
+    """创建带 general Skill 的最小 Runtime 和协调 AgentContext。"""
     resolved_workspace_root = workspace_root.resolve()
     skills_root = resolved_workspace_root / "skills"
     general_skill = skills_root / "general"
@@ -88,7 +90,21 @@ def create_test_runtime(
         ),
     )
     runtime = ContextRuntime(workspace_context, TaskState(goal=task))
-    return runtime, runtime.create_agent_context("root", task, "general")
+    return runtime, runtime.create_agent_context(
+        "coordinator", task, "general", role="coordinator"
+    )
+
+
+def run_test_agent(
+    agent: Agent[AgentDependencies, str],
+    runtime: ContextRuntime,
+    agent_context: AgentContext,
+    request: str | None = None,
+) -> AgentRunResult[str]:
+    """为不启动后台任务的测试同步执行一轮异步 Agent 调用。"""
+    return asyncio.run(
+        run_coordinator_turn(agent, runtime, agent_context, request)
+    ).raw_result
 
 
 class WorkspaceContextBuilderTests(unittest.TestCase):
@@ -190,7 +206,15 @@ class WorkspaceContextBuilderTests(unittest.TestCase):
             builder.build(), TaskState(goal="分析模块")
         )
         with self.assertRaisesRegex(ValueError, "任务不能为空"):
-            runtime.create_agent_context("root", "  ", "general")
+            runtime.create_agent_context("coordinator", "  ", "general")
+        with self.assertRaisesRegex(ValueError, "协调 Agent 上下文不存在"):
+            runtime.create_agent_context(
+                "worker-1",
+                "执行任务",
+                "general",
+                role="task",
+                coordinator_id="missing",
+            )
 
         with tempfile.TemporaryDirectory() as external_directory:
             with self.assertRaisesRegex(ValueError, "工作目录必须"):
@@ -198,43 +222,55 @@ class WorkspaceContextBuilderTests(unittest.TestCase):
                     working_directory=Path(external_directory),
                 )
 
-    def test_child_runtime_state_hides_other_agent_evidence(self) -> None:
-        """子 Agent 只看到自己的证据目录，root 仍可汇总所有证据。"""
+    def test_task_agent_state_hides_other_agent_evidence(self) -> None:
+        """任务 Agent 只看到自己的证据，协调 Agent 可汇总全部证据。"""
         runtime = ContextRuntime(
             WorkspaceContextBuilder(
                 self.workspace_root, self.skills_root
             ).build(),
-            TaskState(goal="父任务"),
+            TaskState(goal="整体任务"),
         )
-        root_context = runtime.create_agent_context(
-            "root", "父任务", "general"
+        coordinator_context = runtime.create_agent_context(
+            "coordinator", "协调任务", "general", role="coordinator"
         )
-        first_child = runtime.create_agent_context(
+        first_task_context = runtime.create_agent_context(
             "explorer-1",
             "任务一",
             "general",
-            parent_agent_id="root",
+            role="task",
+            coordinator_id="coordinator",
         )
-        second_child = runtime.create_agent_context(
+        second_task_context = runtime.create_agent_context(
             "explorer-2",
             "任务二",
             "general",
-            parent_agent_id="root",
+            role="task",
+            coordinator_id="coordinator",
         )
         runtime.register_evidence(
-            "file_read", "first.txt", "lines 1-2", "first", first_child.agent_id
+            "file_read",
+            "first.txt",
+            "lines 1-2",
+            "first",
+            first_task_context.agent_id,
         )
         runtime.register_evidence(
-            "file_read", "second.txt", "lines 1-2", "second", second_child.agent_id
+            "file_read",
+            "second.txt",
+            "lines 1-2",
+            "second",
+            second_task_context.agent_id,
         )
 
-        first_prompt = runtime.build_user_prompt(first_child, "继续")
-        root_prompt = runtime.build_user_prompt(root_context, "汇总")
+        first_prompt = runtime.build_user_prompt(first_task_context, "继续")
+        coordinator_prompt = runtime.build_user_prompt(
+            coordinator_context, "汇总"
+        )
 
         self.assertIn("first.txt", first_prompt)
         self.assertNotIn("second.txt", first_prompt)
-        self.assertIn("first.txt", root_prompt)
-        self.assertIn("second.txt", root_prompt)
+        self.assertIn("first.txt", coordinator_prompt)
+        self.assertIn("second.txt", coordinator_prompt)
 
 
 class AgentRuntimeTests(unittest.TestCase):
@@ -274,7 +310,7 @@ class AgentRuntimeTests(unittest.TestCase):
         model = TestModel(call_tools=[], custom_output_text="最终回答")
         with tempfile.TemporaryDirectory() as workspace_directory:
             workspace_root = Path(workspace_directory).resolve()
-            runtime, root_context = create_test_runtime(
+            runtime, coordinator_context = create_test_runtime(
                 workspace_root,
                 task="检查项目",
                 skill_content="准确回答用户。",
@@ -290,10 +326,10 @@ class AgentRuntimeTests(unittest.TestCase):
                 }
             )
 
-            result = run_agent(
-                create_agent(model),
+            result = run_test_agent(
+                create_coordinator_agent(model),
                 runtime,
-                root_context,
+                coordinator_context,
             )
 
         self.assertEqual("最终回答", result.output)
@@ -306,10 +342,10 @@ class AgentRuntimeTests(unittest.TestCase):
                 "replace_workspace_text",
                 "update_task_state",
                 "select_skill",
-                "delegate_task",
-                "continue_subagent",
-                "list_subagents",
-                "inspect_subagent",
+                "assign_tasks",
+                "send_task_feedback",
+                "list_assignments",
+                "inspect_assignment",
             ],
             [
                 tool.name
@@ -322,6 +358,9 @@ class AgentRuntimeTests(unittest.TestCase):
         )
         self.assertIn("遵守项目约束。", instructions)
         self.assertIn("准确回答用户。", instructions)
+        self.assertIn("像项目经理一样", instructions)
+        self.assertNotIn("父 Agent", instructions)
+        self.assertNotIn("子 Agent", instructions)
         self.assertNotIn("目标：检查项目", instructions)
         self.assertNotIn("状态：in_progress", instructions)
         user_prompt = result.all_messages()[0].parts[0].content
@@ -338,19 +377,19 @@ class AgentRuntimeTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as workspace_directory:
             workspace_root = Path(workspace_directory).resolve()
-            runtime, root_context = create_test_runtime(
+            runtime, coordinator_context = create_test_runtime(
                 workspace_root,
                 task="第一轮",
                 skill_content="准确回答用户。",
             )
-            agent = create_agent(FunctionModel(model_function))
-            first_result = run_agent(
-                agent, runtime, root_context
+            agent = create_coordinator_agent(FunctionModel(model_function))
+            first_result = run_test_agent(
+                agent, runtime, coordinator_context
             )
-            second_result = run_agent(
+            second_result = run_test_agent(
                 agent,
                 runtime,
-                root_context,
+                coordinator_context,
                 request="第二轮",
             )
 
@@ -368,55 +407,152 @@ class AgentRuntimeTests(unittest.TestCase):
             any("## 当前请求\n第二轮" in content for content in message_contents)
         )
         self.assertEqual(
-            second_result.all_messages(), root_context.message_history
+            second_result.all_messages(), coordinator_context.message_history
         )
-        self.assertEqual(2, root_context.turn_count)
+        self.assertEqual(2, coordinator_context.turn_count)
 
-    def test_conversation_reuses_root_context_until_exit_command(self) -> None:
+    def test_conversation_reuses_coordinator_context_until_exit_command(self) -> None:
         """终端连续输入复用同一历史，并且退出命令不会进入模型消息。"""
         requests = iter(["第二轮", "/quit"])
         outputs: list[str] = []
         with tempfile.TemporaryDirectory() as workspace_directory:
-            runtime, root_context = create_test_runtime(
+            runtime, coordinator_context = create_test_runtime(
                 Path(workspace_directory), task="第一轮"
             )
             run_conversation(
-                create_agent(
+                create_coordinator_agent(
                     TestModel(call_tools=[], custom_output_text="持续回答")
                 ),
                 runtime,
-                root_context,
+                coordinator_context,
                 "第一轮",
                 input_fn=lambda _prompt: next(requests),
                 output_fn=outputs.append,
             )
 
         serialized_history = ModelMessagesTypeAdapter.dump_json(
-            root_context.message_history
+            coordinator_context.message_history
         ).decode()
         self.assertEqual(
-            ["Assistant> 持续回答", "Assistant> 持续回答"], outputs
+            [
+                "Call[1] coordinator agent turn 1 started",
+                "Call[1] coordinator agent turn 1 completed "
+                "(requests=1; tool_calls=0)",
+                "Assistant> 持续回答",
+                "Call[2] coordinator agent turn 2 started",
+                "Call[2] coordinator agent turn 2 completed "
+                "(requests=1; tool_calls=0)",
+                "Assistant> 持续回答",
+            ],
+            outputs,
         )
-        self.assertEqual(2, root_context.turn_count)
+        self.assertEqual(2, coordinator_context.turn_count)
         self.assertIn("## 当前请求\\n第一轮", serialized_history)
         self.assertIn("## 当前请求\\n第二轮", serialized_history)
         self.assertNotIn("/quit", serialized_history)
 
+    def test_assignment_completion_resumes_coordinator(self) -> None:
+        """任务完成后，CLI 事件循环自动调用协调 Agent 处理交接。"""
+        auto_response_written = Event()
+        outputs: list[str] = []
+
+        async def model_function(messages, agent_info):
+            if agent_info.output_tools:
+                await asyncio.sleep(0.02)
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name=agent_info.output_tools[0].name,
+                            args={
+                                "status": "completed",
+                                "summary": "后台检查完成",
+                                "evidence_ids": [],
+                                "unresolved_issues": [],
+                                "recommended_next_actions": [],
+                            },
+                        )
+                    ]
+                )
+            contents = [
+                part.content
+                for message in messages
+                for part in message.parts
+                if hasattr(part, "content")
+                and isinstance(part.content, str)
+            ]
+            if any("Runtime 任务完成事件" in text for text in contents):
+                return ModelResponse(parts=[TextPart("已处理后台交接")])
+            if any(
+                getattr(part, "tool_name", None) == "assign_tasks"
+                for message in messages
+                for part in message.parts
+            ):
+                return ModelResponse(parts=[TextPart("协调任务继续执行")])
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="assign_tasks",
+                        args={
+                            "tasks": [
+                                {
+                                    "template": "explorer",
+                                    "task": "检查后台任务",
+                                }
+                            ]
+                        },
+                    )
+                ]
+            )
+
+        def output_fn(message: str) -> None:
+            outputs.append(message)
+            if message == "Assistant> 已处理后台交接":
+                auto_response_written.set()
+
+        def input_fn(_prompt: str) -> str:
+            if not auto_response_written.wait(timeout=2):
+                raise AssertionError("协调 Agent 未在任务完成后自动续跑")
+            return "/quit"
+
+        with tempfile.TemporaryDirectory() as workspace_directory:
+            runtime, coordinator_context = create_test_runtime(
+                Path(workspace_directory), task="启动后台检查"
+            )
+            run_conversation(
+                create_coordinator_agent(FunctionModel(model_function)),
+                runtime,
+                coordinator_context,
+                "启动后台检查",
+                input_fn=input_fn,
+                output_fn=output_fn,
+            )
+
+        self.assertIn("Assistant> 协调任务继续执行", outputs)
+        self.assertIn("Assistant> 已处理后台交接", outputs)
+        self.assertLess(
+            outputs.index("Assistant> 协调任务继续执行"),
+            outputs.index("Assistant> 已处理后台交接"),
+        )
+        self.assertEqual(2, coordinator_context.turn_count)
+        self.assertEqual(
+            "completed", runtime.assignments["explorer-1"].status
+        )
+
     def test_async_agent_turn_returns_uniform_runtime_metadata(self) -> None:
         """异步公开入口返回输出、usage、压缩标记和统一轮次。"""
         with tempfile.TemporaryDirectory() as workspace_directory:
-            runtime, root_context = create_test_runtime(
+            runtime, coordinator_context = create_test_runtime(
                 Path(workspace_directory), task="异步调用"
             )
             turn = asyncio.run(
-                run_agent_turn(
-                    create_agent(
+                run_coordinator_turn(
+                    create_coordinator_agent(
                         TestModel(
                             call_tools=[], custom_output_text="异步完成"
                         )
                     ),
                     runtime,
-                    root_context,
+                    coordinator_context,
                 )
             )
 
@@ -424,10 +560,10 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(1, turn.turn_index)
         self.assertFalse(turn.compacted)
         self.assertEqual(0, turn.compaction_requests)
-        self.assertEqual(turn.messages, root_context.message_history)
+        self.assertEqual(turn.messages, coordinator_context.message_history)
 
     def test_agent_runner_enforces_request_limit(self) -> None:
-        """所有 root 和子 Agent 调用共用 Runner 的模型请求上限。"""
+        """协调 Agent 和任务 Agent 共用 Runner 的模型请求上限。"""
         def model_function(_messages, _agent_info):
             return ModelResponse(
                 parts=[
@@ -439,25 +575,32 @@ class AgentRuntimeTests(unittest.TestCase):
             )
 
         with tempfile.TemporaryDirectory() as workspace_directory:
-            runtime, root_context = create_test_runtime(
+            runtime, coordinator_context = create_test_runtime(
                 Path(workspace_directory), task="持续调用工具"
             )
             runner = AgentRunner(
                 AgentCallLimits(request_limit=1, tool_calls_limit=10)
             )
+            call_events = []
+            runtime.call_event_handler = call_events.append
 
             with self.assertRaises(UsageLimitExceeded):
                 asyncio.run(
                     runner.run_turn(
-                        create_agent(FunctionModel(model_function)),
+                        create_coordinator_agent(FunctionModel(model_function)),
                         runtime,
-                        root_context,
-                        root_context.task,
+                        coordinator_context,
+                        coordinator_context.task,
                     )
                 )
 
-        self.assertEqual(0, root_context.turn_count)
-        self.assertEqual([], root_context.message_history)
+        self.assertEqual(0, coordinator_context.turn_count)
+        self.assertEqual([], coordinator_context.message_history)
+        self.assertEqual(
+            ["started", "failed"],
+            [event.phase for event in call_events],
+        )
+        self.assertIn("UsageLimitExceeded", call_events[-1].detail)
 
     def test_context_compacts_at_seventy_percent_of_one_million_tokens(
         self,
@@ -507,35 +650,39 @@ class AgentRuntimeTests(unittest.TestCase):
             )
 
         with tempfile.TemporaryDirectory() as workspace_directory:
-            runtime, root_context = create_test_runtime(
+            runtime, coordinator_context = create_test_runtime(
                 Path(workspace_directory), task="第一轮"
             )
-            agent = create_agent(FunctionModel(model_function))
-            run_agent(agent, runtime, root_context)
+            agent = create_coordinator_agent(FunctionModel(model_function))
+            run_test_agent(agent, runtime, coordinator_context)
             runtime.register_evidence(
                 "file_read",
                 "context.py",
                 "characters 1-20 of 20",
                 "上下文规则",
-                root_context.agent_id,
+                coordinator_context.agent_id,
             )
             runtime.context_window = ContextWindowPolicy(
                 window_tokens=20, compaction_ratio=0.70
             )
+            call_events = []
+            runtime.call_event_handler = call_events.append
 
-            turn = AgentRunner().run_turn_sync(
-                agent, runtime, root_context, request="第二轮"
+            turn = asyncio.run(
+                AgentRunner().run_turn(
+                    agent, runtime, coordinator_context, request="第二轮"
+                )
             )
             result = turn.raw_result
 
         serialized_history = ModelMessagesTypeAdapter.dump_json(
             result.all_messages()
         ).decode()
-        self.assertEqual(1, root_context.compaction_count)
+        self.assertEqual(1, coordinator_context.compaction_count)
         self.assertTrue(turn.compacted)
         self.assertEqual(1, turn.compaction_requests)
         self.assertEqual(
-            "保留目标和关键结论", root_context.conversation_summary
+            "保留目标和关键结论", coordinator_context.conversation_summary
         )
         self.assertIn("Runtime 压缩历史摘要", serialized_history)
         self.assertNotIn("第一轮回答", serialized_history)
@@ -545,13 +692,22 @@ class AgentRuntimeTests(unittest.TestCase):
             runtime.task_state.important_facts[0].statement,
         )
         self.assertEqual(["继续第二轮"], runtime.task_state.unresolved_issues)
+        self.assertEqual(
+            [
+                ("agent", "started"),
+                ("compaction", "started"),
+                ("compaction", "completed"),
+                ("agent", "completed"),
+            ],
+            [(event.kind, event.phase) for event in call_events],
+        )
 
     def test_next_run_renders_updated_agent_skill(self) -> None:
         """Skill 变化保存在 AgentContext，并在下一次运行时重新渲染。"""
         model = TestModel(call_tools=[], custom_output_text="完成")
         with tempfile.TemporaryDirectory() as workspace_directory:
             workspace_root = Path(workspace_directory).resolve()
-            runtime, root_context = create_test_runtime(workspace_root)
+            runtime, coordinator_context = create_test_runtime(workspace_root)
             review_skill = Path(runtime.workspace.skills_root) / "review"
             review_skill.mkdir()
             (review_skill / "skill.json").write_text(
@@ -561,19 +717,19 @@ class AgentRuntimeTests(unittest.TestCase):
             (review_skill / "SKILL.md").write_text(
                 "只审查当前修改。", encoding="utf-8"
             )
-            agent = create_agent(model)
-            run_agent(agent, runtime, root_context)
+            agent = create_coordinator_agent(model)
+            run_test_agent(agent, runtime, coordinator_context)
 
             select_skill(
                 SimpleNamespace(
-                    deps=AgentDependencies(runtime, root_context)
+                    deps=AgentDependencies(runtime, coordinator_context)
                 ),
                 "review",
             )
-            run_agent(
+            run_test_agent(
                 agent,
                 runtime,
-                root_context,
+                coordinator_context,
                 request="审查修改",
             )
 
@@ -585,20 +741,20 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertNotIn("根据工具证据完成任务。", instructions)
 
     def test_update_task_state_changes_only_model_owned_fields(self) -> None:
-        """root Agent 可更新计划和事实，宿主记录字段保持独立。"""
+        """协调 Agent 可更新计划和事实，Runtime 记录字段保持独立。"""
         with tempfile.TemporaryDirectory() as workspace_directory:
-            runtime, root_context = create_test_runtime(
+            runtime, coordinator_context = create_test_runtime(
                 Path(workspace_directory), task="实现 TaskState"
             )
             tool_context = SimpleNamespace(
-                deps=AgentDependencies(runtime, root_context)
+                deps=AgentDependencies(runtime, coordinator_context)
             )
             evidence = runtime.register_evidence(
                 "file_read",
                 "context.py",
                 "lines 1-20",
                 "class TaskState: Runtime state",
-                root_context.agent_id,
+                coordinator_context.agent_id,
             )
 
             rendered_state = update_task_state(
@@ -649,11 +805,11 @@ class AgentRuntimeTests(unittest.TestCase):
     def test_update_task_state_rejects_unknown_evidence(self) -> None:
         """模型不能把不存在的工具结果登记为已证实事实。"""
         with tempfile.TemporaryDirectory() as workspace_directory:
-            runtime, root_context = create_test_runtime(
+            runtime, coordinator_context = create_test_runtime(
                 Path(workspace_directory)
             )
             tool_context = SimpleNamespace(
-                deps=AgentDependencies(runtime, root_context)
+                deps=AgentDependencies(runtime, coordinator_context)
             )
 
             with self.assertRaisesRegex(
@@ -677,7 +833,7 @@ class AgentRuntimeTests(unittest.TestCase):
     def test_update_task_state_rejects_quote_absent_from_evidence(self) -> None:
         """有效 ID 不能支持工具结果中没有出现的原文。"""
         with tempfile.TemporaryDirectory() as workspace_directory:
-            runtime, root_context = create_test_runtime(
+            runtime, coordinator_context = create_test_runtime(
                 Path(workspace_directory)
             )
             evidence = runtime.register_evidence(
@@ -685,7 +841,7 @@ class AgentRuntimeTests(unittest.TestCase):
                 "auth.py",
                 "characters 1-30 of 30",
                 "API_KEY = settings.api_key",
-                root_context.agent_id,
+                coordinator_context.agent_id,
             )
 
             with self.assertRaisesRegex(
@@ -693,7 +849,7 @@ class AgentRuntimeTests(unittest.TestCase):
             ):
                 update_task_state(
                     SimpleNamespace(
-                        deps=AgentDependencies(runtime, root_context)
+                        deps=AgentDependencies(runtime, coordinator_context)
                     ),
                     important_facts=[
                         FactClaim(
@@ -734,15 +890,15 @@ class AgentRuntimeTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as workspace_directory:
             workspace_root = Path(workspace_directory).resolve()
-            runtime, root_context = create_test_runtime(
+            runtime, coordinator_context = create_test_runtime(
                 workspace_root,
                 task="读取文件",
                 skill_content="根据工具结果回答。",
             )
-            result = run_agent(
-                create_agent(FunctionModel(model_function)),
+            result = run_test_agent(
+                create_coordinator_agent(FunctionModel(model_function)),
                 runtime,
-                root_context,
+                coordinator_context,
             )
 
         retry_parts = [
@@ -782,11 +938,11 @@ class AgentRuntimeTests(unittest.TestCase):
             (workspace_root / "note.txt").write_text(
                 "兼容字段内容", encoding="utf-8"
             )
-            runtime, root_context = create_test_runtime(workspace_root)
-            result = run_agent(
-                create_agent(FunctionModel(model_function)),
+            runtime, coordinator_context = create_test_runtime(workspace_root)
+            result = run_test_agent(
+                create_coordinator_agent(FunctionModel(model_function)),
                 runtime,
-                root_context,
+                coordinator_context,
             )
 
         self.assertEqual("已读取兼容路径", result.output)
@@ -812,13 +968,13 @@ class AgentRuntimeTests(unittest.TestCase):
             )
 
         with tempfile.TemporaryDirectory() as workspace_directory:
-            runtime, root_context = create_test_runtime(
+            runtime, coordinator_context = create_test_runtime(
                 Path(workspace_directory).resolve()
             )
-            result = run_agent(
-                create_agent(FunctionModel(model_function)),
+            result = run_test_agent(
+                create_coordinator_agent(FunctionModel(model_function)),
                 runtime,
-                root_context,
+                coordinator_context,
             )
 
         retry_parts = [
@@ -852,13 +1008,13 @@ class AgentRuntimeTests(unittest.TestCase):
             return ModelResponse(parts=[TextPart("已改用安全工具")])
 
         with tempfile.TemporaryDirectory() as workspace_directory:
-            runtime, root_context = create_test_runtime(
+            runtime, coordinator_context = create_test_runtime(
                 Path(workspace_directory).resolve()
             )
-            result = run_agent(
-                create_agent(FunctionModel(model_function)),
+            result = run_test_agent(
+                create_coordinator_agent(FunctionModel(model_function)),
                 runtime,
-                root_context,
+                coordinator_context,
             )
 
         retry_parts = [
@@ -1012,8 +1168,8 @@ class WorkspaceToolTests(unittest.TestCase):
             )
 
 
-class MultiAgentTests(unittest.TestCase):
-    """验证父 Agent 能创建并继续固定模板的子 Agent 会话。"""
+class TaskCoordinationTests(unittest.TestCase):
+    """验证协调 Agent 能分配并跟进固定模板的任务。"""
 
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -1033,33 +1189,61 @@ class MultiAgentTests(unittest.TestCase):
             self.workspace_root, self.skills_root
         ).build()
         self.runtime = ContextRuntime(
-            workspace_context, TaskState(goal="父任务")
+            workspace_context, TaskState(goal="整体任务")
         )
-        self.root_context = self.runtime.create_agent_context(
-            "root", "父任务", "general"
+        self.coordinator_context = self.runtime.create_agent_context(
+            "coordinator", "协调任务", "general", role="coordinator"
         )
         self.dependencies = AgentDependencies(
             self.runtime,
-            self.root_context,
+            self.coordinator_context,
         )
 
     def test_select_skill_loads_requested_content(self) -> None:
-        """父 Agent 只按需加载选中 Skill 的完整正文。"""
+        """协调 Agent 只按需加载选中 Skill 的完整正文。"""
         tool_context = SimpleNamespace(deps=self.dependencies)
 
         selected_skill = select_skill(tool_context, "general")
 
         self.assertIn("# Skill: general", selected_skill)
         self.assertIn("根据工具证据完成任务。", selected_skill)
-        self.assertEqual("general", self.root_context.skill.metadata.name)
+        self.assertEqual(
+            "general", self.coordinator_context.skill.metadata.name
+        )
 
-    def test_parent_creates_non_recursive_agent_from_template(self) -> None:
-        """explorer 子 Agent 只有只读工作区工具，不具备写入或继续委派能力。"""
-        child_model = TestModel(
+    def test_task_agent_cannot_manage_assignments(self) -> None:
+        """任务职责上下文不能绕过工具注册边界分配其他工作。"""
+        task_context = self.runtime.create_agent_context(
+            "worker-manual",
+            "执行工作包",
+            "general",
+            role="task",
+            coordinator_id=self.coordinator_context.agent_id,
+        )
+        with self.assertRaisesRegex(
+            RecoverableToolError, "没有任务协调职责"
+        ):
+            asyncio.run(
+                assign_tasks(
+                    SimpleNamespace(
+                        deps=AgentDependencies(self.runtime, task_context),
+                        model=TestModel(call_tools=[]),
+                    ),
+                    tasks=[
+                        TaskAssignmentRequest(
+                            template="explorer", task="越权分配"
+                        )
+                    ],
+                )
+            )
+
+    def test_coordinator_assigns_read_only_explorer(self) -> None:
+        """任务分配立即返回，explorer 只获得只读工作区工具。"""
+        task_model = TestModel(
             call_tools=[],
             custom_output_args={
                 "status": "completed",
-                "summary": "子任务完成",
+                "summary": "工作包完成",
                 "evidence_ids": [],
                 "unresolved_issues": [],
                 "recommended_next_actions": [],
@@ -1067,25 +1251,40 @@ class MultiAgentTests(unittest.TestCase):
         )
         tool_context = SimpleNamespace(
             deps=self.dependencies,
-            model=child_model,
+            model=task_model,
         )
 
-        result = asyncio.run(
-            delegate_task(
+        async def run_scenario():
+            receipts = await assign_tasks(
                 tool_context,
-                template="explorer",
-                task="定位相关文件",
-                skill_id="general",
+                tasks=[
+                    TaskAssignmentRequest(
+                        template="explorer",
+                        task="定位相关文件",
+                        skill_id="general",
+                    )
+                ],
             )
-        )
+            receipt = receipts[0]
+            self.assertEqual("running", receipt.status)
+            self.assertEqual([], self.runtime.assignment_history)
+            assignment = self.runtime.assignments[receipt.assignment_id]
+            self.assertIsNotNone(assignment.background_task)
+            await assignment.background_task
+            return receipt, inspect_assignment(
+                SimpleNamespace(deps=self.dependencies),
+                receipt.assignment_id,
+            )
 
-        child_tool_names = [
+        receipt, result = asyncio.run(run_scenario())
+
+        task_tool_names = [
             tool.name
-            for tool in child_model.last_model_request_parameters.function_tools
+            for tool in task_model.last_model_request_parameters.function_tools
         ]
         self.assertEqual("explorer", result.template)
-        self.assertEqual("explorer-1", result.session_id)
-        self.assertEqual("子任务完成", result.summary)
+        self.assertEqual("explorer-1", receipt.assignment_id)
+        self.assertEqual("工作包完成", result.summary)
         self.assertEqual("completed", result.status)
         self.assertEqual(1, result.turn_index)
         self.assertEqual((), result.evidence)
@@ -1093,12 +1292,13 @@ class MultiAgentTests(unittest.TestCase):
         self.assertEqual((), result.validation_results)
         self.assertEqual((), result.unresolved_issues)
         self.assertEqual((), result.recommended_next_actions)
-        child_context = self.runtime.agent_contexts[result.session_id]
-        self.assertIsNot(child_context, self.root_context)
-        self.assertEqual([], self.root_context.message_history)
-        self.assertTrue(child_context.message_history)
-        self.assertEqual("root", child_context.parent_agent_id)
-        self.assertEqual(1, len(self.runtime.handoff_history))
+        task_context = self.runtime.agent_contexts[result.agent_id]
+        self.assertIsNot(task_context, self.coordinator_context)
+        self.assertEqual([], self.coordinator_context.message_history)
+        self.assertTrue(task_context.message_history)
+        self.assertEqual("task", task_context.role)
+        self.assertEqual("coordinator", task_context.coordinator_id)
+        self.assertEqual(1, len(self.runtime.assignment_history))
         self.assertEqual(
             [
                 "list_workspace_files",
@@ -1106,20 +1306,90 @@ class MultiAgentTests(unittest.TestCase):
                 "search_workspace_text",
                 "run_powershell_command",
             ],
-            child_tool_names,
+            task_tool_names,
         )
-        self.assertNotIn("delegate_task", child_tool_names)
-        self.assertNotIn("continue_subagent", child_tool_names)
-        self.assertNotIn("list_subagents", child_tool_names)
-        self.assertNotIn("inspect_subagent", child_tool_names)
+        self.assertNotIn("assign_tasks", task_tool_names)
+        self.assertNotIn("send_task_feedback", task_tool_names)
+        self.assertNotIn("list_assignments", task_tool_names)
+        self.assertNotIn("inspect_assignment", task_tool_names)
 
-    def test_parent_continues_same_subagent_with_previous_history(
+    def test_coordinator_assigns_independent_tasks_without_waiting(self) -> None:
+        """统一分配工具即时返回，工作包随后在后台并行完成。"""
+        active_calls = 0
+        peak_active_calls = 0
+
+        async def task_model_function(_messages, agent_info):
+            nonlocal active_calls, peak_active_calls
+            active_calls += 1
+            peak_active_calls = max(peak_active_calls, active_calls)
+            await asyncio.sleep(0.02)
+            active_calls -= 1
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name=agent_info.output_tools[0].name,
+                        args={
+                            "status": "completed",
+                            "summary": "并行完成",
+                            "evidence_ids": [],
+                            "unresolved_issues": [],
+                            "recommended_next_actions": [],
+                        },
+                    )
+                ]
+            )
+
+        call_events = []
+        self.runtime.call_event_handler = call_events.append
+        async def run_scenario():
+            receipts = await assign_tasks(
+                SimpleNamespace(
+                    deps=self.dependencies,
+                    model=FunctionModel(task_model_function),
+                ),
+                tasks=[
+                    TaskAssignmentRequest(
+                        template="explorer", task="检查模块 A"
+                    ),
+                    TaskAssignmentRequest(
+                        template="reviewer", task="检查模块 B"
+                    ),
+                ],
+            )
+            self.assertEqual(0, active_calls)
+            self.assertEqual(
+                ["running", "running"],
+                [receipt.status for receipt in receipts],
+            )
+            await asyncio.gather(
+                *(
+                    self.runtime.assignments[
+                        receipt.assignment_id
+                    ].background_task
+                    for receipt in receipts
+                )
+            )
+            return receipts
+
+        receipts = asyncio.run(run_scenario())
+
+        self.assertEqual(2, peak_active_calls)
+        self.assertEqual(
+            ["explorer-1", "reviewer-1"],
+            [receipt.assignment_id for receipt in receipts],
+        )
+        self.assertEqual(
+            ["started", "started", "completed", "completed"],
+            [event.phase for event in call_events],
+        )
+
+    def test_coordinator_sends_feedback_to_same_agent_with_history(
         self,
     ) -> None:
-        """验证失败后，父 Agent 可把反馈和原对话交回同一个 worker。"""
+        """验证失败后，协调 Agent 可把反馈交回原 worker。"""
         received_messages = []
 
-        def child_model_function(messages, _agent_info):
+        def task_model_function(messages, _agent_info):
             received_messages.append(messages)
             first_turn = len(received_messages) == 1
             response = "初次实现" if first_turn else "修正实现"
@@ -1148,29 +1418,48 @@ class MultiAgentTests(unittest.TestCase):
 
         tool_context = SimpleNamespace(
             deps=self.dependencies,
-            model=FunctionModel(child_model_function),
+            model=FunctionModel(task_model_function),
         )
-        first_result = asyncio.run(
-            delegate_task(
-                tool_context,
-                template="worker",
-                task="实现功能",
-                skill_id="general",
+        async def run_scenario():
+            first_receipt = (
+                await assign_tasks(
+                    tool_context,
+                    tasks=[
+                        TaskAssignmentRequest(
+                            template="worker",
+                            task="实现功能",
+                            skill_id="general",
+                        )
+                    ],
+                )
+            )[0]
+            assignment = self.runtime.assignments[first_receipt.assignment_id]
+            await assignment.background_task
+            first_result = inspect_assignment(
+                SimpleNamespace(deps=self.dependencies),
+                first_receipt.assignment_id,
             )
-        )
-
-        second_result = asyncio.run(
-            continue_subagent(
+            second_receipt = await send_task_feedback(
                 tool_context,
-                session_id=first_result.session_id,
+                assignment_id=first_receipt.assignment_id,
                 feedback="测试失败，请根据错误修正",
             )
-        )
+            self.assertEqual("running", second_receipt.status)
+            await assignment.background_task
+            second_result = inspect_assignment(
+                SimpleNamespace(deps=self.dependencies),
+                first_receipt.assignment_id,
+            )
+            return first_result, second_result
+
+        first_result, second_result = asyncio.run(run_scenario())
 
         second_run_history = ModelMessagesTypeAdapter.dump_json(
             received_messages[1]
         ).decode()
-        self.assertEqual(first_result.session_id, second_result.session_id)
+        self.assertEqual(
+            first_result.assignment_id, second_result.assignment_id
+        )
         self.assertEqual("needs_follow_up", first_result.status)
         self.assertEqual(("测试失败",), first_result.unresolved_issues)
         self.assertEqual("修正实现", second_result.summary)
@@ -1182,7 +1471,7 @@ class MultiAgentTests(unittest.TestCase):
         self.assertIn("上一轮结构化交接", second_run_history)
         self.assertIn("needs_follow_up", second_run_history)
         self.assertIn("提供失败输出", second_run_history)
-        snapshots = list_subagents(
+        snapshots = list_assignments(
             SimpleNamespace(deps=self.dependencies)
         )
         self.assertEqual(1, len(snapshots))
@@ -1190,19 +1479,19 @@ class MultiAgentTests(unittest.TestCase):
         self.assertEqual(2, snapshots[0].turn_count)
         self.assertEqual(
             second_result,
-            inspect_subagent(
+            inspect_assignment(
                 SimpleNamespace(deps=self.dependencies),
-                first_result.session_id,
+                first_result.assignment_id,
             ),
         )
 
-    def test_subagent_handoff_resolves_tool_evidence(self) -> None:
-        """父 Agent 收到结构化摘要和解析后的证据，而非不可核验文本。"""
+    def test_task_handoff_resolves_tool_evidence(self) -> None:
+        """协调 Agent 收到结构化摘要和解析后的证据。"""
         (self.workspace_root / "note.txt").write_text(
             "关键结论", encoding="utf-8"
         )
 
-        def child_model_function(messages, agent_info):
+        def task_model_function(messages, agent_info):
             tool_results = [
                 part.content
                 for message in messages
@@ -1246,16 +1535,29 @@ class MultiAgentTests(unittest.TestCase):
                 ]
             )
 
-        result = asyncio.run(
-            delegate_task(
-                SimpleNamespace(
-                    deps=self.dependencies,
-                    model=FunctionModel(child_model_function),
-                ),
-                template="explorer",
-                task="读取结论",
+        async def run_scenario():
+            receipt = (
+                await assign_tasks(
+                    SimpleNamespace(
+                        deps=self.dependencies,
+                        model=FunctionModel(task_model_function),
+                    ),
+                    tasks=[
+                        TaskAssignmentRequest(
+                            template="explorer", task="读取结论"
+                        )
+                    ],
+                )
+            )[0]
+            await self.runtime.assignments[
+                receipt.assignment_id
+            ].background_task
+            return inspect_assignment(
+                SimpleNamespace(deps=self.dependencies),
+                receipt.assignment_id,
             )
-        )
+
+        result = asyncio.run(run_scenario())
 
         self.assertEqual("已确认关键结论", result.summary)
         self.assertEqual(1, len(result.evidence))
@@ -1265,35 +1567,81 @@ class MultiAgentTests(unittest.TestCase):
             "note.txt 包含关键结论", result.facts[0].statement
         )
 
-    def test_unknown_subagent_session_is_recoverable(self) -> None:
-        """错误会话 ID 可返回父模型重新选择会话或重新委派。"""
+    def test_unknown_assignment_is_recoverable(self) -> None:
+        """错误分配 ID 可返回协调模型重新安排。"""
         tool_context = SimpleNamespace(deps=self.dependencies)
 
         with self.assertRaisesRegex(
-            RecoverableToolError, "未知子 Agent 会话"
+            RecoverableToolError, "未知任务分配"
         ):
             asyncio.run(
-                continue_subagent(
+                send_task_feedback(
                     tool_context,
-                    session_id="worker-99",
+                    assignment_id="worker-99",
                     feedback="继续修改",
                 )
             )
 
-    def test_unknown_agent_template_is_recoverable(self) -> None:
-        """模板选择错误可返回父模型重新决策。"""
+    def test_unknown_agent_skill_is_recoverable_before_start(self) -> None:
+        """整批 Skill 在创建任何后台会话前完成校验。"""
         tool_context = SimpleNamespace(
             deps=self.dependencies,
             model=TestModel(call_tools=[]),
         )
 
-        with self.assertRaisesRegex(RecoverableToolError, "未知 Agent 模板"):
+        with self.assertRaisesRegex(RecoverableToolError, "无法加载"):
             asyncio.run(
-                delegate_task(
+                assign_tasks(
                     tool_context,
-                    template="unknown",
-                    task="执行任务",
+                    tasks=[
+                        TaskAssignmentRequest(
+                            template="explorer",
+                            task="执行任务",
+                            skill_id="missing",
+                        )
+                    ],
                 )
+            )
+        self.assertEqual({}, self.runtime.assignments)
+
+    def test_background_assignment_failure_is_recorded_and_notified(self) -> None:
+        """后台异常会被记录并形成 failed 任务事件。"""
+        completion_events = []
+
+        async def completion_handler(event):
+            completion_events.append(event)
+
+        async def failing_model(_messages, _agent_info):
+            raise RuntimeError("task model failed")
+
+        async def run_scenario():
+            self.runtime.assignment_completion_handler = completion_handler
+            receipt = (
+                await assign_tasks(
+                    SimpleNamespace(
+                        deps=self.dependencies,
+                        model=FunctionModel(failing_model),
+                    ),
+                    tasks=[
+                        TaskAssignmentRequest(
+                            template="explorer", task="触发失败"
+                        )
+                    ],
+                )
+            )[0]
+            assignment = self.runtime.assignments[receipt.assignment_id]
+            await assignment.background_task
+            return receipt, assignment
+
+        receipt, assignment = asyncio.run(run_scenario())
+
+        self.assertEqual("failed", assignment.status)
+        self.assertIn("task model failed", assignment.error)
+        self.assertEqual("failed", completion_events[0].status)
+        with self.assertRaisesRegex(RecoverableToolError, "执行失败"):
+            inspect_assignment(
+                SimpleNamespace(deps=self.dependencies),
+                receipt.assignment_id,
             )
 
 
