@@ -1,7 +1,11 @@
 """把 Agent Runtime 的可恢复状态保存为版本化 JSON 快照。"""
 
 import json
+import os
 from pathlib import Path
+import tempfile
+from threading import Lock
+import time
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -22,7 +26,10 @@ from .context import (
 )
 
 
-SNAPSHOT_VERSION = 1
+SNAPSHOT_VERSION = 2
+SUPPORTED_SNAPSHOT_VERSIONS = frozenset({1, SNAPSHOT_VERSION})
+WINDOWS_REPLACE_ATTEMPTS = 5
+WINDOWS_REPLACE_RETRY_SECONDS = 0.02
 
 
 class TaskStateSnapshot(BaseModel):
@@ -98,6 +105,12 @@ class RuntimeSnapshot(BaseModel):
     pending_completion_events: list[AssignmentCompletionEvent]
     modified_files_by_agent: dict[str, list[str]]
     validation_results_by_agent: dict[str, list[ValidationResult]]
+    modification_revisions_by_agent: dict[str, int] = Field(
+        default_factory=dict
+    )
+    validated_revisions_by_agent: dict[str, int] = Field(
+        default_factory=dict
+    )
     next_call_id: int
     max_concurrent_assignments: int
 
@@ -107,16 +120,50 @@ class RuntimeStateStore:
 
     def __init__(self, path: Path) -> None:
         self.path = path.resolve()
+        self._write_lock = Lock()
 
     def save(self, runtime: ContextRuntime) -> None:
-        """保存 Runtime；不会序列化模型、回调、锁或 asyncio 任务。"""
-        snapshot = self._create_snapshot(runtime)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = self.path.with_name(f"{self.path.name}.tmp")
-        temporary_path.write_text(
-            snapshot.model_dump_json(indent=2), encoding="utf-8"
-        )
-        temporary_path.replace(self.path)
+        """线程安全地原子保存 Runtime，并容忍 Windows 短暂文件占用。
+
+        每次保存使用唯一的同目录临时文件，避免多个工具线程争用固定 ``.tmp``。
+        文件关闭并刷新到磁盘后再替换目标。Windows 上杀毒软件或另一实例可能短暂
+        持有目标文件，因此 ``PermissionError`` 会按很短的退避间隔有界重试。
+        """
+        with self._write_lock:
+            snapshot = self._create_snapshot(runtime)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_file = tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                newline="",
+                delete=False,
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.",
+                suffix=".tmp",
+            )
+            temporary_path = Path(temporary_file.name)
+            try:
+                with temporary_file:
+                    temporary_file.write(snapshot.model_dump_json(indent=2))
+                    temporary_file.flush()
+                    os.fsync(temporary_file.fileno())
+                self._replace_with_retry(temporary_path)
+            finally:
+                if temporary_path.exists():
+                    temporary_path.unlink()
+
+    def _replace_with_retry(self, temporary_path: Path) -> None:
+        """在 Windows 短暂共享冲突后重试原子替换。"""
+        for attempt in range(WINDOWS_REPLACE_ATTEMPTS):
+            try:
+                temporary_path.replace(self.path)
+                return
+            except PermissionError:
+                if attempt == WINDOWS_REPLACE_ATTEMPTS - 1:
+                    raise
+                time.sleep(
+                    WINDOWS_REPLACE_RETRY_SECONDS * (2 ** attempt)
+                )
 
     def load(self, workspace: WorkspaceContext) -> ContextRuntime | None:
         """读取快照并重建纯状态对象；不存在快照时返回 ``None``。
@@ -129,7 +176,7 @@ class RuntimeStateStore:
         snapshot = RuntimeSnapshot.model_validate_json(
             self.path.read_text(encoding="utf-8")
         )
-        if snapshot.version != SNAPSHOT_VERSION:
+        if snapshot.version not in SUPPORTED_SNAPSHOT_VERSIONS:
             raise ValueError(
                 f"不支持的 Runtime 快照版本：{snapshot.version}"
             )
@@ -190,6 +237,21 @@ class RuntimeStateStore:
         runtime.validation_results_by_agent = (
             snapshot.validation_results_by_agent
         )
+        if snapshot.version == 1:
+            # 版本 1 没有记录修改与验证之间的先后关系。恢复时宁可要求 worker
+            # 重新验证，也不能根据不完整历史推断最新代码已经通过。
+            runtime.modification_revisions_by_agent = {
+                agent_id: len(paths)
+                for agent_id, paths in runtime.modified_files_by_agent.items()
+            }
+            runtime.validated_revisions_by_agent = {}
+        else:
+            runtime.modification_revisions_by_agent = (
+                snapshot.modification_revisions_by_agent
+            )
+            runtime.validated_revisions_by_agent = (
+                snapshot.validated_revisions_by_agent
+            )
         runtime._next_call_id = snapshot.next_call_id
         return runtime
 
@@ -240,6 +302,12 @@ class RuntimeStateStore:
             pending_completion_events=runtime.pending_completion_events,
             modified_files_by_agent=runtime.modified_files_by_agent,
             validation_results_by_agent=runtime.validation_results_by_agent,
+            modification_revisions_by_agent=(
+                runtime.modification_revisions_by_agent
+            ),
+            validated_revisions_by_agent=(
+                runtime.validated_revisions_by_agent
+            ),
             next_call_id=runtime._next_call_id,
             max_concurrent_assignments=runtime.max_concurrent_assignments,
         )

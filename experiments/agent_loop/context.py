@@ -506,6 +506,12 @@ class ContextRuntime:
     validation_results_by_agent: dict[str, list[ValidationResult]] = field(
         default_factory=dict
     )
+    modification_revisions_by_agent: dict[str, int] = field(
+        default_factory=dict
+    )
+    validated_revisions_by_agent: dict[str, int] = field(
+        default_factory=dict
+    )
     max_concurrent_assignments: int = 4
     persistence_handler: Callable[["ContextRuntime"], None] | None = field(
         default=None, repr=False
@@ -513,6 +519,7 @@ class ContextRuntime:
     scheduler: "AssignmentScheduler | None" = field(default=None, repr=False)
     _next_call_id: int = 1
     _state_lock: LockType = field(default_factory=Lock, repr=False)
+    _persistence_lock: LockType = field(default_factory=Lock, repr=False)
 
     def __post_init__(self) -> None:
         """拒绝无效的全局并发配置。"""
@@ -520,9 +527,12 @@ class ContextRuntime:
             raise ValueError("任务并发上限必须为正数")
 
     def persist(self) -> None:
-        """在存在持久化边界时保存当前可恢复状态。"""
-        if self.persistence_handler is not None:
-            self.persistence_handler(self)
+        """串行保存可恢复状态，允许同步工具从多个工作线程调用。"""
+        handler = self.persistence_handler
+        if handler is None:
+            return
+        with self._persistence_lock:
+            handler(self)
 
     def create_agent_context(
         self,
@@ -627,6 +637,9 @@ class ContextRuntime:
         with self._state_lock:
             self.task_state.record_modified_file(path)
             self.modified_files_by_agent.setdefault(agent_id, []).append(path)
+            self.modification_revisions_by_agent[agent_id] = (
+                self.modification_revisions_by_agent.get(agent_id, 0) + 1
+            )
         self.persist()
 
     def record_validation(
@@ -643,6 +656,15 @@ class ContextRuntime:
             self.validation_results_by_agent.setdefault(agent_id, []).append(
                 result
             )
+            if not timed_out and exit_code == 0:
+                self.validated_revisions_by_agent[agent_id] = (
+                    self.modification_revisions_by_agent.get(agent_id, 0)
+                )
+            elif self.modification_revisions_by_agent.get(agent_id, 0) > 0:
+                self.validated_revisions_by_agent[agent_id] = min(
+                    self.validated_revisions_by_agent.get(agent_id, 0),
+                    self.modification_revisions_by_agent[agent_id] - 1,
+                )
         self.persist()
 
     def record_handoff(self, handoff: TaskHandoff) -> None:

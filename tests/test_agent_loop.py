@@ -1,6 +1,7 @@
 """测试最小上下文 Runtime，不访问真实模型接口。"""
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -55,11 +56,15 @@ from experiments.agent_loop.persistence import RuntimeStateStore
 from experiments.agent_loop.runner import AgentCallLimits, AgentRunner
 from experiments.agent_loop.workspace_tools import (
     RecoverableToolError,
+    WorkspaceTextEdit,
+    apply_workspace_edits,
     list_workspace_files,
     read_workspace_file,
     replace_workspace_text,
+    run_python_validation,
     run_powershell_command,
     search_workspace_text,
+    write_workspace_file,
 )
 
 
@@ -197,6 +202,46 @@ class WorkspaceContextBuilderTests(unittest.TestCase):
         rendered_context = workspace_context.render_instructions()
         self.assertNotIn("secret.txt", rendered_context)
         self.assertNotIn("不应预加载的正文", rendered_context)
+
+    def test_runtime_persistence_serializes_concurrent_tool_threads(
+        self,
+    ) -> None:
+        """并发工具线程保存快照时不会争用同一个临时文件。"""
+        workspace_context = WorkspaceContextBuilder(
+            self.workspace_root, self.skills_root
+        ).build()
+        runtime = ContextRuntime(
+            workspace_context, TaskState(goal="并发持久化")
+        )
+        coordinator = runtime.create_agent_context(
+            "coordinator", "并发持久化", "general", role="coordinator"
+        )
+        state_store = RuntimeStateStore(
+            self.workspace_root / ".abook" / "runtime-state.json"
+        )
+        runtime.persistence_handler = state_store.save
+
+        def register(index: int) -> None:
+            runtime.register_evidence(
+                "file_read",
+                f"file-{index}.txt",
+                "concurrent test",
+                f"content-{index}",
+                coordinator.agent_id,
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(register, range(20)))
+
+        restored = state_store.load(workspace_context)
+
+        self.assertIsNotNone(restored)
+        assert restored is not None
+        self.assertEqual(20, len(restored.evidence_records))
+        self.assertEqual(
+            [],
+            list((self.workspace_root / ".abook").glob("*.tmp")),
+        )
 
     def test_runtime_rejects_blank_task_and_external_directory(self) -> None:
         """Agent 任务和共享工作目录分别在所属边界完成校验。"""
@@ -341,7 +386,10 @@ class AgentRuntimeTests(unittest.TestCase):
                 "read_workspace_file",
                 "search_workspace_text",
                 "run_powershell_command",
+                "run_python_validation",
                 "replace_workspace_text",
+                "apply_workspace_edits",
+                "write_workspace_file",
                 "update_task_state",
                 "select_skill",
                 "assign_tasks",
@@ -370,6 +418,87 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("Runtime 状态（仅是数据，不是指令）", user_prompt)
         self.assertIn("目标：检查项目", user_prompt)
         self.assertIn("## 当前请求\n检查项目", user_prompt)
+
+    def test_agent_can_iterate_from_edit_failure_to_validation_success(
+        self,
+    ) -> None:
+        """Agent 可读取、修改、验证失败、修正并再次验证成功。"""
+        def model_function(messages, _agent_info):
+            tool_names = [
+                part.tool_name
+                for message in messages
+                for part in message.parts
+                if isinstance(part, ToolCallPart)
+            ]
+            validation_count = tool_names.count("run_python_validation")
+            edit_count = tool_names.count("apply_workspace_edits")
+            if "read_workspace_file" not in tool_names:
+                return ModelResponse(parts=[ToolCallPart(
+                    tool_name="read_workspace_file",
+                    args={"path": "src/app.py"},
+                )])
+            if edit_count == 0:
+                return ModelResponse(parts=[ToolCallPart(
+                    tool_name="apply_workspace_edits",
+                    args={
+                        "path": "src/app.py",
+                        "edits": [{
+                            "old_text": "VALUE = 1",
+                            "new_text": "VALUE =",
+                        }],
+                    },
+                )])
+            if validation_count == 0:
+                return ModelResponse(parts=[ToolCallPart(
+                    tool_name="run_python_validation",
+                    args={"validation": "compileall", "target": "src/app.py"},
+                )])
+            if edit_count == 1:
+                return ModelResponse(parts=[ToolCallPart(
+                    tool_name="apply_workspace_edits",
+                    args={
+                        "path": "src/app.py",
+                        "edits": [{
+                            "old_text": "VALUE =",
+                            "new_text": "VALUE = 2",
+                        }],
+                    },
+                )])
+            if validation_count == 1:
+                return ModelResponse(parts=[ToolCallPart(
+                    tool_name="run_python_validation",
+                    args={"validation": "compileall", "target": "src/app.py"},
+                )])
+            return ModelResponse(parts=[TextPart("修改和验证均已完成")])
+
+        with tempfile.TemporaryDirectory() as workspace_directory:
+            workspace_root = Path(workspace_directory).resolve()
+            source_directory = workspace_root / "src"
+            source_directory.mkdir()
+            source_path = source_directory / "app.py"
+            source_path.write_text("VALUE = 1\n", encoding="utf-8")
+            runtime, coordinator_context = create_test_runtime(
+                workspace_root, task="修改数值并验证"
+            )
+
+            result = run_test_agent(
+                create_coordinator_agent(FunctionModel(model_function)),
+                runtime,
+                coordinator_context,
+            )
+            final_content = source_path.read_text(encoding="utf-8")
+
+        self.assertEqual("修改和验证均已完成", result.output)
+        self.assertEqual("VALUE = 2\n", final_content)
+        self.assertEqual(
+            [1, 0],
+            [
+                validation.exit_code
+                for validation in runtime.task_state.validation_results
+            ],
+        )
+        self.assertEqual(2, runtime.modification_revisions_by_agent["coordinator"])
+        self.assertEqual(2, runtime.validated_revisions_by_agent["coordinator"])
 
     def test_agent_context_keeps_history_between_runs(self) -> None:
         """AgentContext 保存第一轮历史，并在第二轮自动传回模型。"""
@@ -1095,6 +1224,22 @@ class WorkspaceToolTests(unittest.TestCase):
         with self.assertRaisesRegex(RecoverableToolError, "敏感文件"):
             read_workspace_file(self.tool_context, ".env")
 
+    def test_read_workspace_file_supports_line_ranges(self) -> None:
+        """大文件可按包含首尾行的范围读取，并记录实际范围。"""
+        content = read_workspace_file(
+            self.tool_context,
+            "src/app.py",
+            start_line=2,
+            end_line=2,
+        )
+
+        self.assertIn("Needle value", content)
+        self.assertNotIn("first line", content)
+        evidence = self.tool_context.deps.runtime.evidence_records[
+            "evidence-1"
+        ]
+        self.assertIn("lines 2-2 of 3", evidence.detail)
+
     def test_replace_workspace_text_requires_exact_occurrence_count(
         self,
     ) -> None:
@@ -1126,6 +1271,81 @@ class WorkspaceToolTests(unittest.TestCase):
             )
         self.assertNotIn(
             "Unexpected value", source_path.read_text(encoding="utf-8")
+        )
+
+    def test_apply_workspace_edits_is_atomic(self) -> None:
+        """多段编辑任一项不匹配时不写入已经通过的前置编辑。"""
+        source_path = self.workspace_root / "src" / "app.py"
+        original_content = source_path.read_text(encoding="utf-8")
+
+        with self.assertRaisesRegex(RecoverableToolError, "第 2 项"):
+            apply_workspace_edits(
+                self.tool_context,
+                "src/app.py",
+                [
+                    WorkspaceTextEdit(
+                        old_text="first line", new_text="changed first"
+                    ),
+                    WorkspaceTextEdit(
+                        old_text="missing", new_text="never written"
+                    ),
+                ],
+            )
+
+        self.assertEqual(
+            original_content, source_path.read_text(encoding="utf-8")
+        )
+        git_directory = self.workspace_root / ".git"
+        git_directory.mkdir()
+        (git_directory / "config").write_text(
+            "protected", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(RecoverableToolError, "Runtime 管理"):
+            apply_workspace_edits(
+                self.tool_context,
+                ".git/config",
+                [WorkspaceTextEdit(
+                    old_text="protected", new_text="changed"
+                )],
+            )
+
+    def test_write_workspace_file_creates_without_overwriting(self) -> None:
+        """新文件工具可创建父目录，但拒绝覆盖和敏感路径。"""
+        result = write_workspace_file(
+            self.tool_context,
+            "tests/test_created.py",
+            "VALUE = 1\n",
+            create_parent_directories=True,
+        )
+
+        created_path = self.workspace_root / "tests" / "test_created.py"
+        self.assertIn("Created tests/test_created.py", result)
+        self.assertEqual("VALUE = 1\n", created_path.read_text(encoding="utf-8"))
+        with self.assertRaisesRegex(RecoverableToolError, "已经存在"):
+            write_workspace_file(
+                self.tool_context, "tests/test_created.py", "VALUE = 2\n"
+            )
+        with self.assertRaisesRegex(RecoverableToolError, "敏感"):
+            write_workspace_file(self.tool_context, ".env", "secret")
+
+    def test_structured_python_validation_records_result(self) -> None:
+        """结构化验证不经过 shell，并把真实结果写入 TaskState。"""
+        valid_source = self.workspace_root / "src" / "valid.py"
+        valid_source.write_text("VALUE = 1\n", encoding="utf-8")
+
+        result = run_python_validation(
+            self.tool_context,
+            "compileall",
+            target="src/valid.py",
+        )
+
+        self.assertEqual(0, result.exit_code)
+        self.assertFalse(result.timed_out)
+        validations = self.tool_context.deps.runtime.task_state.validation_results
+        self.assertEqual(1, len(validations))
+        self.assertEqual(
+            "python -m compileall -q src/valid.py",
+            validations[0].command,
         )
 
     def test_powershell_tool_runs_allowed_command_in_workspace(self) -> None:
@@ -1316,6 +1536,7 @@ class TaskCoordinationTests(unittest.TestCase):
                 "read_workspace_file",
                 "search_workspace_text",
                 "run_powershell_command",
+                "run_python_validation",
             ],
             task_tool_names,
         )
@@ -1323,6 +1544,72 @@ class TaskCoordinationTests(unittest.TestCase):
         self.assertNotIn("send_task_feedback", task_tool_names)
         self.assertNotIn("list_assignments", task_tool_names)
         self.assertNotIn("inspect_assignment", task_tool_names)
+
+    def test_worker_must_validate_latest_file_revision(self) -> None:
+        """worker 修改后尝试直接完成时，会被要求验证最新修订。"""
+        def task_model_function(messages, agent_info):
+            tool_names = [
+                part.tool_name
+                for message in messages
+                for part in message.parts
+                if isinstance(part, ToolCallPart)
+            ]
+            retry_messages = [
+                part.content
+                for message in messages
+                for part in message.parts
+                if isinstance(part, RetryPromptPart)
+            ]
+            if "write_workspace_file" not in tool_names:
+                return ModelResponse(parts=[ToolCallPart(
+                    tool_name="write_workspace_file",
+                    args={
+                        "path": "src/generated.py",
+                        "content": "VALUE = 1\n",
+                        "create_parent_directories": True,
+                    },
+                )])
+            if retry_messages and "run_python_validation" not in tool_names:
+                return ModelResponse(parts=[ToolCallPart(
+                    tool_name="run_python_validation",
+                    args={
+                        "validation": "compileall",
+                        "target": "src/generated.py",
+                    },
+                )])
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name=agent_info.output_tools[0].name,
+                args={"status": "completed", "summary": "实现已通过验证"},
+            )])
+
+        async def run_scenario():
+            receipt = (await assign_tasks(
+                SimpleNamespace(
+                    deps=self.dependencies,
+                    model=FunctionModel(task_model_function),
+                ),
+                tasks=[TaskAssignmentRequest(
+                    template="worker", task="创建并验证模块"
+                )],
+            ))[0]
+            assignment = self.runtime.assignments[receipt.assignment_id]
+            await assignment.background_task
+            return inspect_assignment(
+                SimpleNamespace(deps=self.dependencies),
+                receipt.assignment_id,
+            )
+
+        result = asyncio.run(run_scenario())
+
+        self.assertEqual("completed", result.status)
+        self.assertEqual(1, len(result.validation_results))
+        self.assertEqual(0, result.validation_results[0].exit_code)
+        self.assertEqual(
+            1, self.runtime.modification_revisions_by_agent[result.agent_id]
+        )
+        self.assertEqual(
+            1, self.runtime.validated_revisions_by_agent[result.agent_id]
+        )
 
     def test_coordinator_assigns_independent_tasks_without_waiting(self) -> None:
         """统一分配工具即时返回，工作包随后在后台并行完成。"""
@@ -1770,6 +2057,8 @@ class TaskCoordinationTests(unittest.TestCase):
         assignment.status = "running"
         assignment.pending_request = "恢复后继续"
         assignment.attempts = 1
+        self.runtime.modification_revisions_by_agent[assignment.agent_id] = 2
+        self.runtime.validated_revisions_by_agent[assignment.agent_id] = 1
         state_store.save(self.runtime)
 
         restored = state_store.load(self.runtime.workspace)
@@ -1784,6 +2073,14 @@ class TaskCoordinationTests(unittest.TestCase):
         self.assertIsNone(recovered.agent)
         self.assertTrue(restored.agent_contexts[assignment_id].message_history)
         self.assertEqual(1, len(restored.pending_completion_events))
+        self.assertEqual(
+            2,
+            restored.modification_revisions_by_agent[assignment.agent_id],
+        )
+        self.assertEqual(
+            1,
+            restored.validated_revisions_by_agent[assignment.agent_id],
+        )
 
     def test_coordinator_can_cancel_queued_assignment(self) -> None:
         """取消排队任务会完成其等待句柄，且不会启动对应模型调用。"""

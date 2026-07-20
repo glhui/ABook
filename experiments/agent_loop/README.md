@@ -90,13 +90,16 @@ Runtime 验证 quote 确实存在后，才将其合并为长期 `TaskFact`，后
 
 ## 执行工具
 
-协调 Agent 当前具有十二个核心工具：
+协调 Agent 当前具有十五个核心工具：
 
 - `list_workspace_files`：递归列出工作区文件，跳过 `.git`、`.venv` 和缓存目录。
-- `read_workspace_file`：读取 UTF-8 文件，超过上限时明确标记截断。
+- `read_workspace_file`：按可选行范围读取 UTF-8 文件，超过上限时明确标记截断。
 - `search_workspace_text`：搜索大小写不敏感的字面文本并返回文件和行号。
 - `replace_workspace_text`：校验原文本出现次数后执行精确替换。
+- `apply_workspace_edits`：验证并原子提交同一文件内的多段精确替换。
+- `write_workspace_file`：创建新的 UTF-8 文件，不覆盖已有路径。
 - `run_powershell_command`：运行一条受限的 PowerShell 或 Windows CLI 命令。
+- `run_python_validation`：结构化运行 unittest、compileall 或 pip check。
 - `update_task_state`：更新计划、重要事实、完成条件和任务状态。
 - `select_skill`：根据 manifest 目录按需加载另一个 Skill 的完整正文。
 - `assign_tasks`：把 1 到 8 个工作包交给模板 Agent，并立即返回任务分配 ID。
@@ -112,17 +115,28 @@ Runtime 验证 quote 确实存在后，才将其合并为长期 `TaskFact`，后
 工具在结构化 `CommandResult` 中返回该字段；证据记录还保留实际返回文本，供
 `FactClaim` 的 quote 做精确子串校验。
 
-精确替换成功后，Runtime 自动把相对路径加入 `TaskState.modified_files`。Python
-测试、编译和 `pip check` 实际执行后，Runtime 自动记录命令、退出码和超时状态；
-失败结果也会保留，供下一步修正，而不会被模型改写成成功。
+精确替换和新文件创建成功后，Runtime 自动把相对路径加入
+`TaskState.modified_files`。`apply_workspace_edits` 会先在内存中依次验证所有编辑，
+任意原文本次数不符都不会写入部分结果；验证通过后使用同目录临时文件原子替换。
+写工具拒绝 `.env`、`.git`、`.venv` 和缓存目录。已有文件不能通过整文件写入覆盖，
+必须先读取再使用精确编辑，避免覆盖其他并发修改。
+
+Python 测试、编译和 `pip check` 实际执行后，Runtime 自动记录命令、退出码和超时
+状态；失败结果也会保留，供下一步修正，而不会被模型改写成成功。
+`run_python_validation` 直接使用当前 Python 解释器和固定参数列表，不经过 shell，
+因此模型不需要拼接 PowerShell 命令。典型代码闭环是：搜索和分段读取相关实现，
+创建测试或精确修改代码，运行最小相关验证，根据真实 stdout/stderr 再次修改，最后
+运行完整测试、compileall 和 pip check。Runtime 为每个 Agent 单独维护修改修订号
+和已验证修订号；worker 写入文件后，只有成功验证覆盖最新修订，才能提交
+`completed` 交接。后续修改或失败验证会再次关闭该完成门槛。
 
 路径不存在、越过工作区、替换次数不一致或命令被策略拒绝时，工具只抛出统一的
 `RecoverableToolError`。`RetryToolset` 在工具执行边界将它转换为 PydanticAI
 `ModelRetry`，PydanticAI 再生成 `RetryPromptPart` 并请求模型重新决策。具体工具
 不依赖重试协议，也不需要重复编写异常转换代码。
 
-精确替换工具具有副作用，Agent 指令和工具文档都要求只有用户明确要求修改文件
-时才能调用。替换次数与预期不一致时会拒绝写入，避免模糊替换修改额外位置。
+文件编辑和创建工具具有副作用，Agent 指令和工具文档都要求只有用户明确要求修改
+文件时才能调用。替换次数与预期不一致时会拒绝写入，避免模糊替换修改额外位置。
 
 PowerShell 工具采用单命令白名单，只允许工作区查询、只读 Git 子命令、`rg`，
 以及 Python 测试、编译和 `pip check`。它拒绝管道、重定向、变量展开、父目录、
@@ -167,7 +181,10 @@ runtime 的命令边界；因此需要分支或工作区状态时，Agent 应通
 CLI 把状态持久化到工作区的 `.abook/runtime-state.json`。快照使用版本化 Pydantic
 结构并通过同目录临时文件原子替换，包含整体任务状态、各 Agent 消息历史、证据、
 交接、任务调度元数据、修改和验证记录。模型实例、异步锁、协程句柄与回调不会写入
-JSON，而是在启动后重建。进程退出时仍为 `queued` 的任务会继续排队；原先为
+JSON，而是在启动后重建。同步工具可能由 PydanticAI 在线程池并发执行，因此
+Runtime 会串行化保存请求；每次保存使用唯一临时文件，Windows 原子替换遇到短暂
+文件占用时执行有界退避重试，避免多个工具争用固定 `.tmp` 文件。进程退出时仍为
+`queued` 的任务会继续排队；原先为
 `running` 的协程无法跨进程恢复，因此会注明中断原因并重新排队执行。
 
 后台任务使用 CLI 的持续事件循环并发执行。Runtime 会把短时间内完成、失败、阻塞

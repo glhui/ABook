@@ -105,7 +105,9 @@ AGENT_TEMPLATES = {
             description="实现用户已经明确授权的代码修改并运行验证",
             instructions=(
                 "完成一个范围明确的实现任务。只有任务明确要求修改时才写文件，"
-                "修改后运行相关验证并报告结果。"
+                "先读取相关代码和测试，再使用精确编辑或新建文件工具修改。修改后"
+                "调用 run_python_validation 运行最小相关验证；失败时读取真实输出、"
+                "修正并再次验证，直到通过或遇到无法自行解决的明确阻塞。"
             ),
             can_write=True,
         ),
@@ -283,6 +285,23 @@ def _create_task_agent(
                 "交接引用了当前任务 Agent 未获得的证据 ID："
                 + ", ".join(unknown_ids)
             )
+        if template.name == "worker" and report.status == "completed":
+            agent_id = run_context.deps.agent_context.agent_id
+            modification_revision = (
+                run_context.deps.runtime.modification_revisions_by_agent.get(
+                    agent_id, 0
+                )
+            )
+            validated_revision = (
+                run_context.deps.runtime.validated_revisions_by_agent.get(
+                    agent_id, 0
+                )
+            )
+            if validated_revision < modification_revision:
+                raise ModelRetry(
+                    "worker 修改了文件，但最新修改尚未通过验证。"
+                    "请调用 run_python_validation，根据真实结果修正后再完成交接。"
+                )
         return report
 
     @task_agent.instructions

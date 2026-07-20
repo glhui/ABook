@@ -5,7 +5,9 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
-from typing import Annotated, Any
+import sys
+import tempfile
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import ModelRetry, RunContext
@@ -25,6 +27,8 @@ MAX_SEARCH_MATCHES = 50
 MAX_SEARCHED_FILES = 500
 MAX_MATCH_LINE_LENGTH = 300
 MAX_REPLACEMENT_TEXT_LENGTH = 20_000
+MAX_NEW_FILE_CHARACTERS = 50_000
+MAX_TEXT_EDITS = 20
 MAX_COMMAND_LENGTH = 2_000
 MAX_COMMAND_OUTPUT_CHARACTERS = 20_000
 MAX_COMMAND_TIMEOUT_SECONDS = 120
@@ -80,6 +84,16 @@ class CommandResult(BaseModel):
     timed_out: bool
 
 
+class WorkspaceTextEdit(BaseModel):
+    """一个必须按预期次数命中的精确文本编辑。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    old_text: str = Field(min_length=1, max_length=MAX_REPLACEMENT_TEXT_LENGTH)
+    new_text: str = Field(max_length=MAX_REPLACEMENT_TEXT_LENGTH)
+    expected_replacements: int = Field(default=1, ge=1, le=100)
+
+
 class RecoverableToolError(Exception):
     """表示模型可通过修改参数或改用其他工具修正的失败。"""
 
@@ -108,7 +122,8 @@ class RetryToolset(WrapperToolset[AgentDependencies]):
                 return (
                     f"Command rejected by workspace policy: {error}. "
                     "Do not retry this command. Use list_workspace_files, "
-                    "read_workspace_file, or search_workspace_text when possible."
+                    "read_workspace_file, search_workspace_text, or "
+                    "run_python_validation when possible."
                 )
             raise ModelRetry(str(error)) from error
 
@@ -133,6 +148,51 @@ def _resolve_workspace_path(
         raise RecoverableToolError("路径必须位于工作区根目录内")
     if resolved_path.name in SENSITIVE_WORKSPACE_FILE_NAMES:
         raise RecoverableToolError("工具不能访问包含凭据的敏感文件")
+    return resolved_path
+
+
+def _resolve_new_workspace_path(
+    workspace_root: Path,
+    requested_path: str,
+) -> Path:
+    """解析尚不存在的写入路径，并拒绝敏感或 Runtime 管理目录。"""
+    relative_path = Path(requested_path)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise RecoverableToolError("路径必须是工作区根目录下的相对路径")
+    sensitive_names = {
+        name.casefold() for name in SENSITIVE_WORKSPACE_FILE_NAMES
+    }
+    ignored_names = {
+        name.casefold() for name in IGNORED_WORKSPACE_DIRECTORIES
+    }
+    if any(
+        part.casefold() in sensitive_names
+        or part.casefold() in ignored_names
+        for part in relative_path.parts
+    ):
+        raise RecoverableToolError("不能在敏感或 Runtime 管理目录中写入文件")
+    resolved_path = (workspace_root / relative_path).resolve(strict=False)
+    if not resolved_path.is_relative_to(workspace_root):
+        raise RecoverableToolError("路径必须位于工作区根目录内")
+    return resolved_path
+
+
+def _resolve_writable_workspace_path(
+    workspace_root: Path,
+    requested_path: str,
+) -> Path:
+    """解析已有写入目标，并拒绝敏感或 Runtime 管理目录。"""
+    resolved_path = _resolve_workspace_path(workspace_root, requested_path)
+    relative_parts = resolved_path.relative_to(workspace_root).parts
+    protected_names = {
+        name.casefold()
+        for name in (
+            *SENSITIVE_WORKSPACE_FILE_NAMES,
+            *IGNORED_WORKSPACE_DIRECTORIES,
+        )
+    }
+    if any(part.casefold() in protected_names for part in relative_parts):
+        raise RecoverableToolError("不能修改敏感或 Runtime 管理目录中的文件")
     return resolved_path
 
 
@@ -235,6 +295,18 @@ def read_workspace_file(
             description="最多返回的字符数",
         ),
     ] = 10_000,
+    start_line: Annotated[
+        int,
+        Field(ge=1, le=1_000_000, description="从该行开始读取，行号从 1 开始"),
+    ] = 1,
+    end_line: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            le=1_000_000,
+            description="读取到该行并包含该行；省略时读取到文件末尾",
+        ),
+    ] = None,
 ) -> str:
     """读取 UTF-8 工作区文件；无效路径会反馈给模型重新选择。
 
@@ -263,21 +335,34 @@ def read_workspace_file(
         raise RecoverableToolError(
             "文件不是 UTF-8 文本，请改用其他文件或工具。"
         ) from error
+    if end_line is not None and end_line < start_line:
+        raise RecoverableToolError("end_line 不能小于 start_line")
+    content_lines = content.splitlines(keepends=True)
+    line_count = len(content_lines)
+    if line_count and start_line > line_count:
+        raise RecoverableToolError(
+            f"start_line 超出文件行数：文件共 {line_count} 行"
+        )
+    selected_end = min(end_line or line_count, line_count)
+    selected_content = "".join(
+        content_lines[start_line - 1:selected_end]
+    )
     relative_path = resolved_path.relative_to(
         ctx.deps.workspace_root
     ).as_posix()
-    returned_characters = min(len(content), max_characters)
-    if len(content) <= max_characters:
-        result = content
+    returned_characters = min(len(selected_content), max_characters)
+    if len(selected_content) <= max_characters:
+        result = selected_content
     else:
         result = (
-            content[:max_characters]
+            selected_content[:max_characters]
             + f"\n... truncated after {max_characters} characters."
         )
     evidence = ctx.deps.runtime.register_evidence(
         "file_read",
         relative_path,
-        f"characters 1-{returned_characters} of {len(content)}",
+        f"lines {start_line}-{selected_end} of {line_count}; "
+        f"returned {returned_characters} characters",
         result,
         ctx.deps.agent_context.agent_id,
     )
@@ -416,27 +501,100 @@ def replace_workspace_text(
     该工具会修改文件。替换前必须验证原文本出现次数，避免模型使用模糊匹配
     意外修改额外位置；校验失败时文件保持不变。
     """
-    resolved_path = _resolve_workspace_path(ctx.deps.workspace_root, path)
+    result = apply_workspace_edits(
+        ctx,
+        path,
+        [
+            WorkspaceTextEdit(
+                old_text=old_text,
+                new_text=new_text,
+                expected_replacements=expected_replacements,
+            )
+        ],
+    )
+    evidence_header = result.splitlines()[0]
+    return (
+        f"{evidence_header}\nReplaced {expected_replacements} "
+        f"occurrence(s) in {Path(path).as_posix()}."
+    )
+
+
+def apply_workspace_edits(
+    ctx: RunContext[AgentDependencies],
+    path: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=500,
+            description="工作区根目录下要修改的 UTF-8 文件相对路径",
+        ),
+    ],
+    edits: Annotated[
+        list[WorkspaceTextEdit],
+        Field(
+            min_length=1,
+            max_length=MAX_TEXT_EDITS,
+            description="按顺序应用且必须全部通过次数校验的精确编辑",
+        ),
+    ],
+) -> str:
+    """原子应用一个文件内的多段精确编辑。
+
+    该工具只在用户明确授权修改时使用。所有编辑先在内存中按顺序验证；任意一项
+    次数不符都会保持原文件不变。验证全部通过后才使用同目录临时文件替换目标。
+    """
+    resolved_path = _resolve_writable_workspace_path(
+        ctx.deps.workspace_root, path
+    )
     if not resolved_path.is_file():
         raise RecoverableToolError("path 必须指向工作区文件")
     try:
-        content = resolved_path.read_text(encoding="utf-8")
+        original_content = resolved_path.read_text(encoding="utf-8")
     except UnicodeDecodeError as error:
         raise RecoverableToolError(
             "文件不是 UTF-8 文本，请改用其他文件或工具。"
         ) from error
-    actual_replacements = content.count(old_text)
-    if actual_replacements != expected_replacements:
-        raise RecoverableToolError(
-            "原文本出现次数与 expected_replacements 不一致："
-            f"expected={expected_replacements}, actual={actual_replacements}。"
-            "请重新读取文件并提供精确原文本。"
+
+    updated_content = original_content
+    edit_summaries: list[str] = []
+    total_replacements = 0
+    for index, edit in enumerate(edits, start=1):
+        actual_replacements = updated_content.count(edit.old_text)
+        if actual_replacements != edit.expected_replacements:
+            raise RecoverableToolError(
+                f"第 {index} 项原文本出现次数不符："
+                f"expected={edit.expected_replacements}, "
+                f"actual={actual_replacements}。"
+                "文件未修改；请重新读取后提供精确原文本。"
+            )
+        updated_content = updated_content.replace(
+            edit.old_text,
+            edit.new_text,
+            edit.expected_replacements,
+        )
+        total_replacements += actual_replacements
+        edit_summaries.append(
+            f"edit {index}: old_text={edit.old_text}\n"
+            f"new_text={edit.new_text}"
         )
 
-    updated_content = content.replace(
-        old_text, new_text, expected_replacements
+    temporary_file = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="",
+        delete=False,
+        dir=resolved_path.parent,
+        prefix=f".{resolved_path.name}.abook-",
+        suffix=".tmp",
     )
-    resolved_path.write_text(updated_content, encoding="utf-8")
+    temporary_path = Path(temporary_file.name)
+    try:
+        with temporary_file:
+            temporary_file.write(updated_content)
+        temporary_path.replace(resolved_path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
     relative_path = resolved_path.relative_to(
         ctx.deps.workspace_root
     ).as_posix()
@@ -446,13 +604,82 @@ def replace_workspace_text(
     evidence = ctx.deps.runtime.register_evidence(
         "file_change",
         relative_path,
-        f"replaced {actual_replacements} occurrence(s)",
-        f"old_text={old_text}\nnew_text={new_text}",
+        f"applied {len(edits)} edit(s); replaced {total_replacements} occurrence(s)",
+        "\n\n".join(edit_summaries),
         ctx.deps.agent_context.agent_id,
     )
     return _with_evidence(
         evidence.evidence_id,
-        f"Replaced {actual_replacements} occurrence(s) in {relative_path}.",
+        f"Applied {len(edits)} edit(s) with {total_replacements} "
+        f"replacement(s) in {relative_path}.",
+    )
+
+
+def write_workspace_file(
+    ctx: RunContext[AgentDependencies],
+    path: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=500,
+            description="要创建的工作区相对文件路径",
+        ),
+    ],
+    content: Annotated[
+        str,
+        Field(
+            max_length=MAX_NEW_FILE_CHARACTERS,
+            description="要以 UTF-8 写入的新文件完整内容",
+        ),
+    ],
+    create_parent_directories: Annotated[
+        bool,
+        Field(description="父目录不存在时是否一并创建"),
+    ] = False,
+) -> str:
+    """创建新的 UTF-8 文件，绝不覆盖已有路径。
+
+    该工具只在用户明确授权修改时使用。已有文件必须通过精确编辑工具修改，避免
+    模型用整文件写入意外覆盖并发变更。
+    """
+    resolved_path = _resolve_new_workspace_path(
+        ctx.deps.workspace_root, path
+    )
+    if resolved_path.exists():
+        raise RecoverableToolError(
+            "目标路径已经存在；请读取文件并使用 apply_workspace_edits"
+        )
+    parent = resolved_path.parent
+    if not parent.exists():
+        if not create_parent_directories:
+            raise RecoverableToolError(
+                "父目录不存在；确认路径后设置 create_parent_directories=true"
+            )
+        parent.mkdir(parents=True, exist_ok=True)
+    if not parent.is_dir():
+        raise RecoverableToolError("目标文件的父路径不是目录")
+    try:
+        with resolved_path.open("x", encoding="utf-8", newline="") as stream:
+            stream.write(content)
+    except FileExistsError as error:
+        raise RecoverableToolError("目标路径已经存在，文件未覆盖") from error
+
+    relative_path = resolved_path.relative_to(
+        ctx.deps.workspace_root
+    ).as_posix()
+    ctx.deps.runtime.record_modified_file(
+        relative_path, ctx.deps.agent_context.agent_id
+    )
+    evidence = ctx.deps.runtime.register_evidence(
+        "file_change",
+        relative_path,
+        f"created UTF-8 file with {len(content)} characters",
+        content,
+        ctx.deps.agent_context.agent_id,
+    )
+    return _with_evidence(
+        evidence.evidence_id,
+        f"Created {relative_path} with {len(content)} characters.",
     )
 
 
@@ -692,6 +919,152 @@ def run_powershell_command(
     )
 
 
+def run_python_validation(
+    ctx: RunContext[AgentDependencies],
+    validation: Annotated[
+        Literal["unittest", "compileall", "pip_check"],
+        Field(description="要执行的 Python 离线验证类型"),
+    ],
+    target: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=500,
+            description=(
+                "unittest 的起始目录或 compileall 的文件/目录；pip_check 忽略"
+            ),
+        ),
+    ] = "tests",
+    pattern: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=100,
+            description="unittest discover 文件模式，例如 test*.py",
+        ),
+    ] = "test*.py",
+    timeout_seconds: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=MAX_COMMAND_TIMEOUT_SECONDS,
+            description="验证超时秒数",
+        ),
+    ] = 120,
+) -> CommandResult:
+    """使用当前 Python 解释器运行结构化离线验证。
+
+    参数会转换为固定的 ``subprocess`` 参数列表，不经过 PowerShell 或其他 shell。
+    每次调用无论成功、失败或超时都会写入 Runtime 验证记录和命令证据，供 Agent
+    根据真实输出继续修正，而不能把未运行的测试声称为通过。
+    """
+    arguments: list[str]
+    if validation == "pip_check":
+        arguments = [sys.executable, "-m", "pip", "check"]
+        command = "python -m pip check"
+    else:
+        resolved_target = _resolve_workspace_path(
+            ctx.deps.workspace_root, target
+        )
+        relative_target = resolved_target.relative_to(
+            ctx.deps.workspace_root
+        ).as_posix() or "."
+        if validation == "unittest":
+            if not resolved_target.is_dir():
+                raise RecoverableToolError(
+                    "unittest target 必须指向工作区目录"
+                )
+            if not re.fullmatch(r"[A-Za-z0-9_.*?-]+", pattern):
+                raise RecoverableToolError(
+                    "pattern 只能包含文件名常用字符和通配符"
+                )
+            arguments = [
+                sys.executable,
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                str(resolved_target),
+                "-p",
+                pattern,
+                "-v",
+            ]
+            command = (
+                f"python -m unittest discover -s {relative_target} "
+                f"-p {pattern} -v"
+            )
+        else:
+            arguments = [
+                sys.executable,
+                "-m",
+                "compileall",
+                "-q",
+                str(resolved_target),
+            ]
+            command = f"python -m compileall -q {relative_target}"
+
+    try:
+        completed_process = subprocess.run(
+            arguments,
+            cwd=ctx.deps.workspace_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        stdout = _truncate_command_output(error.stdout)
+        stderr = _truncate_command_output(error.stderr)
+        ctx.deps.runtime.record_validation(
+            command=command,
+            exit_code=None,
+            timed_out=True,
+            agent_id=ctx.deps.agent_context.agent_id,
+        )
+        evidence = ctx.deps.runtime.register_evidence(
+            "command",
+            command,
+            "timed out; exit_code=None",
+            f"timed_out=True\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            ctx.deps.agent_context.agent_id,
+        )
+        return CommandResult(
+            evidence_id=evidence.evidence_id,
+            command=command,
+            exit_code=None,
+            stdout=stdout,
+            stderr=stderr,
+            timed_out=True,
+        )
+
+    stdout = _truncate_command_output(completed_process.stdout)
+    stderr = _truncate_command_output(completed_process.stderr)
+    ctx.deps.runtime.record_validation(
+        command=command,
+        exit_code=completed_process.returncode,
+        timed_out=False,
+        agent_id=ctx.deps.agent_context.agent_id,
+    )
+    evidence = ctx.deps.runtime.register_evidence(
+        "command",
+        command,
+        f"exit_code={completed_process.returncode}",
+        f"exit_code={completed_process.returncode}\n"
+        f"stdout:\n{stdout}\nstderr:\n{stderr}",
+        ctx.deps.agent_context.agent_id,
+    )
+    return CommandResult(
+        evidence_id=evidence.evidence_id,
+        command=command,
+        exit_code=completed_process.returncode,
+        stdout=stdout,
+        stderr=stderr,
+        timed_out=False,
+    )
+
+
 def create_workspace_toolset(can_write: bool) -> RetryToolset:
     """为 Agent 创建统一重试边界下的工作区工具集。"""
     tools = [
@@ -699,9 +1072,16 @@ def create_workspace_toolset(can_write: bool) -> RetryToolset:
         read_workspace_file,
         search_workspace_text,
         run_powershell_command,
+        run_python_validation,
     ]
     if can_write:
-        tools.append(replace_workspace_text)
+        tools.extend(
+            [
+                replace_workspace_text,
+                apply_workspace_edits,
+                write_workspace_file,
+            ]
+        )
     return RetryToolset(
         FunctionToolset[AgentDependencies](tools=tools, max_retries=2)
     )
