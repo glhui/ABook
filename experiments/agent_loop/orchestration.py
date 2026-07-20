@@ -1,11 +1,10 @@
 """定义协调 Agent 的任务分配工具、执行模板和结构化交接协议。"""
 
-import asyncio
-
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import Agent, ModelRetry, RunContext
+from pydantic_ai.models import Model
 
 from .context import (
     AgentDependencies,
@@ -18,6 +17,7 @@ from .context import (
     TaskHandoff,
 )
 from .runner import AgentRunner, AgentTurnResult
+from .scheduler import AssignmentScheduler
 from .workspace_tools import RecoverableToolError, create_workspace_toolset
 
 
@@ -55,6 +55,9 @@ class TaskAssignmentRequest(BaseModel):
     template: Literal["explorer", "worker", "reviewer"]
     task: str = Field(min_length=1, max_length=4_000)
     skill_id: str = Field(default="general", pattern=SKILL_ID_PATTERN.pattern)
+    priority: int = Field(default=0, ge=-100, le=100)
+    depends_on: list[str] = Field(default_factory=list, max_length=20)
+    max_attempts: int = Field(default=1, ge=1, le=5)
 
 
 class TaskAssignmentReceipt(BaseModel):
@@ -65,7 +68,7 @@ class TaskAssignmentReceipt(BaseModel):
     assignment_id: str
     template: str
     task: str
-    status: Literal["running"] = "running"
+    status: Literal["queued", "running"] = "queued"
 
 
 class AssignmentSnapshot(BaseModel):
@@ -77,7 +80,8 @@ class AssignmentSnapshot(BaseModel):
     template: str
     turn_count: int
     status: Literal[
-        "running", "completed", "needs_follow_up", "blocked", "failed"
+        "queued", "running", "completed", "needs_follow_up", "blocked",
+        "failed", "cancelled"
     ]
     latest_summary: str | None
     error: str | None
@@ -185,6 +189,7 @@ def update_task_state(
         )
     if status is not None:
         task_state.status = status
+    ctx.deps.runtime.persist()
     return task_state.render()
 
 
@@ -206,6 +211,7 @@ def select_skill(
             f"无法选择 Skill {skill_id!r}：{error}"
         ) from error
     ctx.deps.agent_context.skill = skill
+    ctx.deps.runtime.persist()
     return f"# Skill: {skill.metadata.name}\n\n{skill.content}"
 
 
@@ -216,12 +222,12 @@ def _require_coordinator(ctx: RunContext[AgentDependencies]) -> None:
 
 
 def _create_task_agent(
-    ctx: RunContext[AgentDependencies],
+    model: Model,
     template: AgentTemplate,
 ) -> Agent[AgentDependencies, TaskReport]:
     """按模板创建专注具体工作包的 Agent，并注册交接证据校验。"""
     task_agent = Agent(
-        ctx.model,
+        model,
         deps_type=AgentDependencies,
         output_type=TaskReport,
         instructions=(
@@ -304,21 +310,20 @@ async def assign_tasks(
 ) -> tuple[TaskAssignmentReceipt, ...]:
     """分配工作包并立即返回回执，不等待执行 Agent 完成。
 
-    每个工作包完成后由 Runtime 保存结构化交接，并触发协调 Agent 根据结果重新
-    安排。并行 worker 必须避免修改相同文件；当前不提供排队、取消或额外超时。
+    每个工作包先进入统一调度队列；调度器按优先级、依赖和全局并发上限启动，
+    最终完成后由 Runtime 保存结构化交接并通知协调 Agent 重新安排。
     """
     _require_coordinator(ctx)
     for request in tasks:
         _validate_assignment_request(ctx, request)
 
+    scheduler = _ensure_scheduler(ctx)
     receipts: list[TaskAssignmentReceipt] = []
     for request in tasks:
         assignment = _create_assignment_session(ctx, request)
         task_context = ctx.deps.runtime.agent_contexts[assignment.agent_id]
         receipts.append(
-            _schedule_assignment_turn(
-                ctx.deps.runtime, assignment, task_context.task
-            )
+            _schedule_assignment_turn(scheduler, assignment, task_context.task)
         )
     return tuple(receipts)
 
@@ -352,8 +357,8 @@ async def send_task_feedback(
         )
     if assignment.coordinator_id != ctx.deps.agent_context.agent_id:
         raise RecoverableToolError("只有发出该任务的协调 Agent 可以提交反馈")
-    if assignment.status == "running":
-        raise RecoverableToolError("该任务仍在运行，不能重复提交反馈")
+    if assignment.status in {"queued", "running"}:
+        raise RecoverableToolError("该任务仍在排队或运行，不能重复提交反馈")
 
     previous = assignment.latest_handoff
     if previous is None:
@@ -373,7 +378,29 @@ async def send_task_feedback(
         "上一轮结构化交接：\n"
         f"{previous_context}"
     )
-    return _schedule_assignment_turn(runtime, assignment, request)
+    return _schedule_assignment_turn(_ensure_scheduler(ctx), assignment, request)
+
+
+async def cancel_assignment(
+    ctx: RunContext[AgentDependencies],
+    assignment_id: Annotated[
+        str, Field(min_length=1, max_length=100, description="要取消的任务分配 ID")
+    ],
+    reason: Annotated[
+        str, Field(min_length=1, max_length=1_000, description="取消原因")
+    ],
+) -> str:
+    """取消当前协调 Agent 发出的排队中或运行中的任务。"""
+    _require_coordinator(ctx)
+    assignment = ctx.deps.runtime.assignments.get(assignment_id)
+    if (
+        assignment is None
+        or assignment.coordinator_id != ctx.deps.agent_context.agent_id
+    ):
+        raise RecoverableToolError(f"未知任务分配 {assignment_id!r}")
+    if not await _ensure_scheduler(ctx).cancel(assignment_id, reason):
+        raise RecoverableToolError("任务已经结束，不能取消")
+    return f"任务分配 {assignment_id} 已取消"
 
 
 def _validate_assignment_request(
@@ -391,6 +418,15 @@ def _validate_assignment_request(
         raise RecoverableToolError(
             f"无法加载任务 Agent Skill {request.skill_id!r}：{error}"
         ) from error
+    unknown_dependencies = [
+        dependency
+        for dependency in request.depends_on
+        if dependency not in ctx.deps.runtime.assignments
+    ]
+    if unknown_dependencies:
+        raise RecoverableToolError(
+            "未知依赖任务：" + ", ".join(unknown_dependencies)
+        )
 
 
 def _create_assignment_session(
@@ -418,28 +454,29 @@ def _create_assignment_session(
         coordinator_id=coordinator_context.agent_id,
         agent_id=task_context.agent_id,
         template=template.name,
-        agent=_create_task_agent(ctx, template),
+        agent=_create_task_agent(ctx.model, template),
+        priority=request.priority,
+        depends_on=tuple(dict.fromkeys(request.depends_on)),
+        max_attempts=request.max_attempts,
     )
     runtime.assignments[assignment_id] = assignment
+    runtime.persist()
     return assignment
 
 
 def _schedule_assignment_turn(
-    runtime: ContextRuntime,
+    scheduler: AssignmentScheduler,
     assignment: AssignmentSession,
     request: str,
 ) -> TaskAssignmentReceipt:
-    """把一轮任务 Agent 调用放入当前事件循环并返回即时回执。"""
-    assignment.status = "running"
-    assignment.error = None
-    assignment.background_task = asyncio.create_task(
-        _run_assignment_turn(runtime, assignment, request)
-    )
-    task_context = runtime.agent_contexts[assignment.agent_id]
+    """把一轮任务 Agent 调用放入调度队列并返回即时回执。"""
+    scheduler.enqueue(assignment, request)
+    task_context = scheduler.runtime.agent_contexts[assignment.agent_id]
     return TaskAssignmentReceipt(
         assignment_id=assignment.assignment_id,
         template=assignment.template,
         task=task_context.task,
+        status=assignment.status,
     )
 
 
@@ -447,7 +484,7 @@ async def _run_assignment_turn(
     runtime: ContextRuntime,
     assignment: AssignmentSession,
     request: str,
-) -> None:
+) -> AssignmentCompletionEvent:
     """在后台完成工作包，保存交接并通知协调 Agent 重新安排。"""
     task_context = runtime.agent_contexts[assignment.agent_id]
     modified_files_before = len(
@@ -458,6 +495,8 @@ async def _run_assignment_turn(
     )
     event: AssignmentCompletionEvent
     try:
+        if assignment.agent is None:
+            raise RuntimeError("任务 Agent 尚未恢复")
         turn = await DEFAULT_AGENT_RUNNER.run_turn(
             assignment.agent, runtime, task_context, request
         )
@@ -488,16 +527,39 @@ async def _run_assignment_turn(
             status="failed",
             error=assignment.error,
         )
-    if runtime.assignment_completion_handler is not None:
-        try:
-            await runtime.assignment_completion_handler(event)
-        except Exception as error:
-            # 任务结果已经安全落入 Runtime；协调调用失败不能反向改写执行状态，
-            # 但诊断信息会保留，并由 Runner 的 failed 事件提示 CLI。
-            assignment.error = (
-                "协调 Agent 自动续跑失败："
-                f"{type(error).__name__}: {error}"
+        runtime.persist()
+    return event
+
+
+def _ensure_scheduler(
+    ctx: RunContext[AgentDependencies],
+) -> AssignmentScheduler:
+    """按当前模型创建调度器，并重建快照中不可序列化的任务 Agent。"""
+    return initialize_assignment_scheduler(ctx.deps.runtime, ctx.model)
+
+
+def initialize_assignment_scheduler(
+    runtime: ContextRuntime,
+    model: Model,
+) -> AssignmentScheduler:
+    """在宿主事件循环启动后重建调度器并恢复未完成任务。"""
+    if runtime.scheduler is not None:
+        return runtime.scheduler
+    for assignment in runtime.assignments.values():
+        if assignment.agent is None:
+            assignment.agent = _create_task_agent(
+                model, AGENT_TEMPLATES[assignment.template]
             )
+
+    async def execute(
+        assignment: AssignmentSession, request: str
+    ) -> AssignmentCompletionEvent:
+        return await _run_assignment_turn(runtime, assignment, request)
+
+    scheduler = AssignmentScheduler(runtime, execute)
+    runtime.scheduler = scheduler
+    scheduler.restore_queued()
+    return scheduler
 
 
 def list_assignments(
@@ -551,7 +613,7 @@ def inspect_assignment(
                 f"任务分配 {assignment_id!r} 执行失败：{assignment.error}"
             )
         raise RecoverableToolError(
-            f"任务分配 {assignment_id!r} 仍在运行，尚无交接"
+            f"任务分配 {assignment_id!r} 仍在排队或运行，尚无交接"
         )
     return assignment.latest_handoff
 

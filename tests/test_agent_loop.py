@@ -25,6 +25,7 @@ from pydantic_ai.tools import ToolDefinition
 from experiments.agent_loop.agent_runtime import (
     TaskAssignmentRequest,
     assign_tasks,
+    cancel_assignment,
     create_coordinator_agent,
     inspect_assignment,
     list_assignments,
@@ -50,6 +51,7 @@ from experiments.agent_loop.main import (
     DeepSeekThinkingChatModel,
     run_conversation,
 )
+from experiments.agent_loop.persistence import RuntimeStateStore
 from experiments.agent_loop.runner import AgentCallLimits, AgentRunner
 from experiments.agent_loop.workspace_tools import (
     RecoverableToolError,
@@ -343,6 +345,7 @@ class AgentRuntimeTests(unittest.TestCase):
                 "update_task_state",
                 "select_skill",
                 "assign_tasks",
+                "cancel_assignment",
                 "send_task_feedback",
                 "list_assignments",
                 "inspect_assignment",
@@ -497,6 +500,10 @@ class AgentRuntimeTests(unittest.TestCase):
                                 {
                                     "template": "explorer",
                                     "task": "检查后台任务",
+                                },
+                                {
+                                    "template": "reviewer",
+                                    "task": "并行复核后台任务",
                                 }
                             ]
                         },
@@ -537,6 +544,10 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(
             "completed", runtime.assignments["explorer-1"].status
         )
+        self.assertEqual(
+            "completed", runtime.assignments["reviewer-1"].status
+        )
+        self.assertEqual([], runtime.pending_completion_events)
 
     def test_async_agent_turn_returns_uniform_runtime_metadata(self) -> None:
         """异步公开入口返回输出、usage、压缩标记和统一轮次。"""
@@ -1266,7 +1277,7 @@ class TaskCoordinationTests(unittest.TestCase):
                 ],
             )
             receipt = receipts[0]
-            self.assertEqual("running", receipt.status)
+            self.assertEqual("queued", receipt.status)
             self.assertEqual([], self.runtime.assignment_history)
             assignment = self.runtime.assignments[receipt.assignment_id]
             self.assertIsNotNone(assignment.background_task)
@@ -1358,7 +1369,7 @@ class TaskCoordinationTests(unittest.TestCase):
             )
             self.assertEqual(0, active_calls)
             self.assertEqual(
-                ["running", "running"],
+                ["queued", "queued"],
                 [receipt.status for receipt in receipts],
             )
             await asyncio.gather(
@@ -1444,7 +1455,7 @@ class TaskCoordinationTests(unittest.TestCase):
                 assignment_id=first_receipt.assignment_id,
                 feedback="测试失败，请根据错误修正",
             )
-            self.assertEqual("running", second_receipt.status)
+            self.assertEqual("queued", second_receipt.status)
             await assignment.background_task
             second_result = inspect_assignment(
                 SimpleNamespace(deps=self.dependencies),
@@ -1643,6 +1654,187 @@ class TaskCoordinationTests(unittest.TestCase):
                 SimpleNamespace(deps=self.dependencies),
                 receipt.assignment_id,
             )
+
+    def test_scheduler_honors_concurrency_limit_and_priority(self) -> None:
+        """单并发调度按优先级启动同一批次的任务。"""
+        self.runtime.max_concurrent_assignments = 1
+        start_order: list[str] = []
+        active_calls = 0
+        peak_active_calls = 0
+
+        async def task_model_function(messages, agent_info):
+            nonlocal active_calls, peak_active_calls
+            serialized = ModelMessagesTypeAdapter.dump_json(messages).decode()
+            start_order.append("high" if "高优先级" in serialized else "low")
+            active_calls += 1
+            peak_active_calls = max(peak_active_calls, active_calls)
+            await asyncio.sleep(0.01)
+            active_calls -= 1
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name=agent_info.output_tools[0].name,
+                args={"status": "completed", "summary": "完成"},
+            )])
+
+        async def run_scenario() -> None:
+            receipts = await assign_tasks(
+                SimpleNamespace(
+                    deps=self.dependencies,
+                    model=FunctionModel(task_model_function),
+                ),
+                tasks=[
+                    TaskAssignmentRequest(
+                        template="explorer", task="低优先级", priority=-10
+                    ),
+                    TaskAssignmentRequest(
+                        template="reviewer", task="高优先级", priority=10
+                    ),
+                ],
+            )
+            await asyncio.gather(*[
+                self.runtime.assignments[receipt.assignment_id].background_task
+                for receipt in receipts
+            ])
+
+        asyncio.run(run_scenario())
+        self.assertEqual(1, peak_active_calls)
+        self.assertEqual(["high", "low"], start_order)
+
+    def test_scheduler_retries_failure_and_releases_dependency(self) -> None:
+        """失败任务按策略重试，成功后再释放依赖任务。"""
+        attempts = 0
+        execution_order: list[str] = []
+
+        async def task_model_function(messages, agent_info):
+            nonlocal attempts
+            serialized = ModelMessagesTypeAdapter.dump_json(messages).decode()
+            if "先执行" in serialized:
+                attempts += 1
+                execution_order.append(f"first-{attempts}")
+                if attempts == 1:
+                    raise RuntimeError("temporary failure")
+            else:
+                execution_order.append("dependent")
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name=agent_info.output_tools[0].name,
+                args={"status": "completed", "summary": "完成"},
+            )])
+
+        async def run_scenario() -> None:
+            tool_context = SimpleNamespace(
+                deps=self.dependencies,
+                model=FunctionModel(task_model_function),
+            )
+            first = (await assign_tasks(
+                tool_context,
+                tasks=[TaskAssignmentRequest(
+                    template="explorer", task="先执行", max_attempts=2
+                )],
+            ))[0]
+            dependent = (await assign_tasks(
+                tool_context,
+                tasks=[TaskAssignmentRequest(
+                    template="reviewer",
+                    task="依赖后执行",
+                    depends_on=[first.assignment_id],
+                )],
+            ))[0]
+            await asyncio.gather(
+                self.runtime.assignments[first.assignment_id].background_task,
+                self.runtime.assignments[dependent.assignment_id].background_task,
+            )
+
+        asyncio.run(run_scenario())
+        self.assertEqual(["first-1", "first-2", "dependent"], execution_order)
+        self.assertEqual("completed", self.runtime.assignments["reviewer-1"].status)
+
+    def test_runtime_snapshot_recovers_interrupted_assignment(self) -> None:
+        """快照保留历史和调度元数据，并把中断运行转换为排队。"""
+        state_store = RuntimeStateStore(self.workspace_root / "state.json")
+        self.runtime.persistence_handler = state_store.save
+
+        async def run_scenario() -> str:
+            receipt = (await assign_tasks(
+                SimpleNamespace(deps=self.dependencies, model=TestModel(call_tools=[])),
+                tasks=[TaskAssignmentRequest(
+                    template="explorer",
+                    task="可恢复任务",
+                    priority=7,
+                    max_attempts=3,
+                )],
+            ))[0]
+            await self.runtime.assignments[receipt.assignment_id].background_task
+            return receipt.assignment_id
+
+        assignment_id = asyncio.run(run_scenario())
+        assignment = self.runtime.assignments[assignment_id]
+        assignment.status = "running"
+        assignment.pending_request = "恢复后继续"
+        assignment.attempts = 1
+        state_store.save(self.runtime)
+
+        restored = state_store.load(self.runtime.workspace)
+
+        self.assertIsNotNone(restored)
+        assert restored is not None
+        recovered = restored.assignments[assignment_id]
+        self.assertEqual("queued", recovered.status)
+        self.assertEqual(7, recovered.priority)
+        self.assertEqual(3, recovered.max_attempts)
+        self.assertEqual(1, recovered.attempts)
+        self.assertIsNone(recovered.agent)
+        self.assertTrue(restored.agent_contexts[assignment_id].message_history)
+        self.assertEqual(1, len(restored.pending_completion_events))
+
+    def test_coordinator_can_cancel_queued_assignment(self) -> None:
+        """取消排队任务会完成其等待句柄，且不会启动对应模型调用。"""
+        self.runtime.max_concurrent_assignments = 1
+        release_first = asyncio.Event()
+        started_tasks: list[str] = []
+
+        async def task_model_function(messages, agent_info):
+            serialized = ModelMessagesTypeAdapter.dump_json(messages).decode()
+            task_name = "first" if "占用并发位" in serialized else "second"
+            started_tasks.append(task_name)
+            if task_name == "first":
+                await release_first.wait()
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name=agent_info.output_tools[0].name,
+                args={"status": "completed", "summary": "完成"},
+            )])
+
+        async def run_scenario() -> None:
+            tool_context = SimpleNamespace(
+                deps=self.dependencies,
+                model=FunctionModel(task_model_function),
+            )
+            receipts = await assign_tasks(
+                tool_context,
+                tasks=[
+                    TaskAssignmentRequest(
+                        template="explorer", task="占用并发位"
+                    ),
+                    TaskAssignmentRequest(
+                        template="reviewer", task="等待后取消"
+                    ),
+                ],
+            )
+            await asyncio.sleep(0)
+            await cancel_assignment(
+                tool_context, receipts[1].assignment_id, "不再需要复核"
+            )
+            await self.runtime.assignments[
+                receipts[1].assignment_id
+            ].background_task
+            release_first.set()
+            await self.runtime.assignments[
+                receipts[0].assignment_id
+            ].background_task
+
+        asyncio.run(run_scenario())
+        self.assertEqual(["first"], started_tasks)
+        cancelled = self.runtime.assignments["reviewer-1"]
+        self.assertEqual("cancelled", cancelled.status)
+        self.assertEqual("不再需要复核", cancelled.error)
 
 
 if __name__ == "__main__":

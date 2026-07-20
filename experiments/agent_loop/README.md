@@ -37,6 +37,8 @@ agent_loop/
 ├─ workspace_tools.py  文件工具、PowerShell 工具和统一重试边界
 ├─ runner.py           协调 Agent 与任务 Agent 共用的调用生命周期
 ├─ orchestration.py    Skill、任务分配和结构化交接工具
+├─ scheduler.py        优先级、依赖、重试、取消和全局并发调度
+├─ persistence.py      版本化 Runtime JSON 快照与恢复
 ├─ agent_runtime.py    协调 Agent 定义和异步调用入口
 ├─ main.py             模型配置与命令行入口
 └─ skills/             可按需加载的 Skill
@@ -88,7 +90,7 @@ Runtime 验证 quote 确实存在后，才将其合并为长期 `TaskFact`，后
 
 ## 执行工具
 
-协调 Agent 当前具有十一个核心工具：
+协调 Agent 当前具有十二个核心工具：
 
 - `list_workspace_files`：递归列出工作区文件，跳过 `.git`、`.venv` 和缓存目录。
 - `read_workspace_file`：读取 UTF-8 文件，超过上限时明确标记截断。
@@ -98,6 +100,7 @@ Runtime 验证 quote 确实存在后，才将其合并为长期 `TaskFact`，后
 - `update_task_state`：更新计划、重要事实、完成条件和任务状态。
 - `select_skill`：根据 manifest 目录按需加载另一个 Skill 的完整正文。
 - `assign_tasks`：把 1 到 8 个工作包交给模板 Agent，并立即返回任务分配 ID。
+- `cancel_assignment`：取消仍在排队或运行的任务分配。
 - `send_task_feedback`：非阻塞地把修正反馈提交给原任务 Agent。
 - `list_assignments`：列出任务分配、轮次和最新状态。
 - `inspect_assignment`：读取指定任务最近一次完整结构化交接。
@@ -143,8 +146,15 @@ runtime 的命令边界；因此需要分支或工作区状态时，Agent 应通
 所有 Agent 引用同一个 `WorkspaceContext`，但每个 Agent 都有独立的
 `AgentContext` 和消息历史。`role="coordinator"` 表示整体规划职责，`role="task"`
 表示当前只负责一个工作包。角色只决定职责和工具范围。任务 Agent 不注册任务
-分配工具，只能使用模板允许的工作区工具。`assign_tasks` 立即返回 `running` 状态
+分配工具，只能使用模板允许的工作区工具。`assign_tasks` 立即返回 `queued` 状态
 和 `assignment_id`，不会等待执行完成。
+
+每个请求可以设置 `priority`、`depends_on` 和 `max_attempts`。调度器在下一事件
+循环周期统一选择就绪任务，先运行较高优先级任务，并把全局并发限制在 Runtime 的
+`max_concurrent_assignments`（默认 4）以内。依赖只有进入 `completed` 才会释放
+后续任务；依赖失败、阻塞或取消时，后续任务会明确进入 `blocked`。执行异常按
+`max_attempts` 重试。协调 Agent 可用 `cancel_assignment` 取消排队或运行中的任务。
+这些限制不包含 token 或费用预算。
 
 每轮交接包含 `completed`、`needs_follow_up` 或 `blocked` 状态，以及结构化摘要、
 带逐字引用的事实、已解析证据、实际修改文件、实际验证结果、未决问题和建议下一
@@ -152,12 +162,18 @@ runtime 的命令边界；因此需要分支或工作区状态时，Agent 应通
 调用补入，不能由模型自行声称。`completed` 不允许保留未决事项，其他状态必须
 说明未决事项；Runtime 同时校验任务归属和连续轮次。协调 Agent 可检查交接，使用
 `send_task_feedback` 把修正要求交回原执行 Agent，或用 `assign_tasks` 重新分配新的
-工作包。任务分配只保存在当前 Runtime 内存中，不做跨进程恢复。
+工作包。
 
-后台任务使用 CLI 的持续事件循环并发执行，不提供排队、取消或额外超时机制。
-任一任务 Agent 完成或失败后，Runtime 保存状态并自动触发一轮协调调用；协调
-Agent 根据最新交接更新计划，不必等待同批其他工作。并行 worker 必须修改不同
-文件。Runtime 按 Agent 单独记录修改和验证，避免错误归属副作用。
+CLI 把状态持久化到工作区的 `.abook/runtime-state.json`。快照使用版本化 Pydantic
+结构并通过同目录临时文件原子替换，包含整体任务状态、各 Agent 消息历史、证据、
+交接、任务调度元数据、修改和验证记录。模型实例、异步锁、协程句柄与回调不会写入
+JSON，而是在启动后重建。进程退出时仍为 `queued` 的任务会继续排队；原先为
+`running` 的协程无法跨进程恢复，因此会注明中断原因并重新排队执行。
+
+后台任务使用 CLI 的持续事件循环并发执行。Runtime 会把短时间内完成、失败、阻塞
+或取消的事件合并成一个批次，再触发一轮协调调用，避免同批任务逐个造成重复规划。
+协调 Agent 根据该批交接统一更新计划。并行 worker 必须修改不同文件。Runtime 按
+Agent 单独记录修改和验证，避免错误归属副作用。当前未增加额外的任务执行超时。
 
 ## 运行
 

@@ -68,6 +68,8 @@ ABook/
 |       |-- workspace_tools.py # 文件、PowerShell 与重试工具
 |       |-- runner.py          # 统一模型调用、usage 与历史生命周期
 |       |-- orchestration.py   # 任务分配、Skill 与结构化交接
+|       |-- scheduler.py       # 队列、依赖、重试、取消与并发调度
+|       |-- persistence.py     # Runtime JSON 快照与恢复
 |       |-- agent_runtime.py   # 协调 Agent 定义和调用入口
 |       `-- main.py            # 实验命令行入口
 |-- .env.example       # 环境变量模板，不包含真实密钥

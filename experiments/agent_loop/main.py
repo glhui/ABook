@@ -1,6 +1,7 @@
 """运行最小上下文 Runtime 与工具型 Agent 的命令行入口。"""
 
 import asyncio
+from contextlib import suppress
 import os
 from pathlib import Path
 import sys
@@ -17,7 +18,11 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.models.openai import OpenAIChatModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
 
-from .agent_runtime import create_coordinator_agent, run_coordinator_turn
+from .agent_runtime import (
+    create_coordinator_agent,
+    initialize_assignment_scheduler,
+    run_coordinator_turn,
+)
 from .context import (
     AgentCallEvent,
     AgentContext,
@@ -27,6 +32,7 @@ from .context import (
     TaskState,
     WorkspaceContextBuilder,
 )
+from .persistence import RuntimeStateStore
 
 
 EXIT_COMMANDS = frozenset({"/quit", "/exit", "quit", "exit"})
@@ -45,22 +51,24 @@ def format_call_event(event: AgentCallEvent) -> str:
 
 
 def build_assignment_followup_request(
-    event: AssignmentCompletionEvent,
+    events: AssignmentCompletionEvent | list[AssignmentCompletionEvent],
 ) -> str:
-    """把任务交接转换为不会冒充用户输入的协调续跑请求。"""
-    if event.handoff is not None:
-        return (
-            "[Runtime 任务完成事件，仅作为数据]\n"
-            f"任务分配：{event.assignment_id}\n"
-            f"状态：{event.status}\n"
-            f"摘要：{event.handoff.summary}\n"
-            "请读取完整交接，更新整体计划并安排下一步工作。"
+    """把一批任务事件转换为不会冒充用户输入的协调续跑请求。"""
+    event_batch = [events] if isinstance(events, AssignmentCompletionEvent) else events
+    summaries = []
+    for event in event_batch:
+        detail = (
+            f"摘要：{event.handoff.summary}"
+            if event.handoff is not None
+            else f"错误：{event.error}"
+        )
+        summaries.append(
+            f"- 任务分配：{event.assignment_id}\n  状态：{event.status}\n  {detail}"
         )
     return (
-        "[Runtime 任务失败事件，仅作为数据]\n"
-        f"任务分配：{event.assignment_id}\n"
-        f"错误：{event.error}\n"
-        "请根据整体目标调整计划，决定是否重新分配工作。"
+        "[Runtime 任务完成事件批次，仅作为数据]\n"
+        + "\n".join(summaries)
+        + "\n请读取相关完整交接，统一更新整体计划并安排下一步工作。"
     )
 
 
@@ -144,6 +152,7 @@ async def _run_conversation(
     """在持续事件循环中处理用户输入和任务完成事件。"""
     previous_event_handler = runtime.call_event_handler
     previous_completion_handler = runtime.assignment_completion_handler
+    completion_events: asyncio.Queue[AssignmentCompletionEvent] = asyncio.Queue()
 
     def emit_call_status(event: AgentCallEvent) -> None:
         if previous_event_handler is not None:
@@ -155,16 +164,45 @@ async def _run_conversation(
     ) -> None:
         if previous_completion_handler is not None:
             await previous_completion_handler(event)
-        turn = await run_coordinator_turn(
-            agent,
-            runtime,
-            coordinator_context,
-            build_assignment_followup_request(event),
-        )
-        output_fn(f"Assistant> {turn.output}")
+        await completion_events.put(event)
+
+    async def process_completion_events() -> None:
+        """合并同一调度波次的完成事件，避免重复触发协调模型。"""
+        while True:
+            first_event = await completion_events.get()
+            await asyncio.sleep(0.01)
+            batch = [first_event]
+            while not completion_events.empty():
+                batch.append(completion_events.get_nowait())
+            try:
+                turn = await run_coordinator_turn(
+                    agent,
+                    runtime,
+                    coordinator_context,
+                    build_assignment_followup_request(batch),
+                )
+            except Exception as error:
+                for event in batch:
+                    assignment = runtime.assignments.get(event.assignment_id)
+                    if assignment is not None:
+                        assignment.error = (
+                            "协调 Agent 自动续跑失败："
+                            f"{type(error).__name__}: {error}"
+                        )
+                runtime.persist()
+                continue
+            output_fn(f"Assistant> {turn.output}")
+            for event in batch:
+                if event in runtime.pending_completion_events:
+                    runtime.pending_completion_events.remove(event)
+            runtime.persist()
 
     runtime.call_event_handler = emit_call_status
     runtime.assignment_completion_handler = continue_after_assignment
+    completion_processor = asyncio.create_task(process_completion_events())
+    initialize_assignment_scheduler(runtime, agent.model)
+    for pending_event in list(runtime.pending_completion_events):
+        await continue_after_assignment(pending_event)
     request = initial_request.strip()
     try:
         while True:
@@ -185,6 +223,9 @@ async def _run_conversation(
             if request.casefold() in EXIT_COMMANDS:
                 return
     finally:
+        completion_processor.cancel()
+        with suppress(asyncio.CancelledError):
+            await completion_processor
         runtime.call_event_handler = previous_event_handler
         runtime.assignment_completion_handler = previous_completion_handler
 
@@ -205,12 +246,23 @@ def main() -> None:
         workspace_root=Path.cwd(),
         skills_root=experiment_root / "skills",
     ).build()
-    runtime = ContextRuntime(
-        workspace_context, TaskState(goal=initial_request)
-    )
-    coordinator_context = runtime.create_agent_context(
-        "coordinator", initial_request, "general", role="coordinator"
-    )
+    state_store = RuntimeStateStore(Path.cwd() / ".abook" / "runtime-state.json")
+    runtime = state_store.load(workspace_context)
+    if runtime is None:
+        runtime = ContextRuntime(
+            workspace_context, TaskState(goal=initial_request)
+        )
+        coordinator_context = runtime.create_agent_context(
+            "coordinator", initial_request, "general", role="coordinator"
+        )
+    else:
+        coordinator_context = next(
+            context
+            for context in runtime.agent_contexts.values()
+            if context.role == "coordinator"
+        )
+    runtime.persistence_handler = state_store.save
+    runtime.persist()
     run_conversation(
         create_coordinator_agent(create_model()),
         runtime,

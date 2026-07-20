@@ -1,5 +1,6 @@
 """统一执行协调 Agent 与任务 Agent 的模型调用和上下文生命周期。"""
 
+import asyncio
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
@@ -183,6 +184,18 @@ class AgentRunner:
                     tool_calls_limit=self.limits.tool_calls_limit,
                 ),
             )
+        except asyncio.CancelledError:
+            runtime.emit_call_event(
+                AgentCallEvent(
+                    call_id=call_id,
+                    agent_id=agent_context.agent_id,
+                    kind="agent",
+                    phase="failed",
+                    turn_index=turn_index,
+                    detail="CancelledError: 调用已取消",
+                )
+            )
+            raise
         except Exception as error:
             runtime.emit_call_event(
                 AgentCallEvent(
@@ -238,6 +251,7 @@ class AgentRunner:
                 ),
             )
         )
+        runtime.persist()
         return turn_result
 
     async def _compact_history(
@@ -280,6 +294,18 @@ class AgentRunner:
                     tool_calls_limit=1,
                 ),
             )
+        except asyncio.CancelledError:
+            runtime.emit_call_event(
+                AgentCallEvent(
+                    call_id=call_id,
+                    agent_id=agent_context.agent_id,
+                    kind="compaction",
+                    phase="failed",
+                    turn_index=agent_context.turn_count + 1,
+                    detail="CancelledError: 调用已取消",
+                )
+            )
+            raise
         except Exception as error:
             runtime.emit_call_event(
                 AgentCallEvent(
@@ -379,3 +405,4 @@ def _apply_checkpoint(
         ),
         *retained_messages,
     ]
+    runtime.persist()

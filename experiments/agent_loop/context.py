@@ -6,11 +6,14 @@ from _thread import LockType
 from pathlib import Path
 import re
 from threading import Lock
-from typing import Awaitable, Callable, Literal
+from typing import TYPE_CHECKING, Awaitable, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
+
+if TYPE_CHECKING:
+    from .scheduler import AssignmentScheduler
 
 
 SKILL_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]*$")
@@ -208,13 +211,16 @@ class AgentCallEvent:
     detail: str | None = None
 
 
-@dataclass(frozen=True)
-class AssignmentCompletionEvent:
+class AssignmentCompletionEvent(BaseModel):
     """后台任务分配结束后发送给协调 Agent 的完成或失败通知。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     assignment_id: str
     coordinator_id: str
-    status: Literal["completed", "needs_follow_up", "blocked", "failed"]
+    status: Literal[
+        "completed", "needs_follow_up", "blocked", "failed", "cancelled"
+    ]
     handoff: TaskHandoff | None = None
     error: str | None = None
 
@@ -406,10 +412,21 @@ class AssignmentSession:
     coordinator_id: str
     agent_id: str
     template: str
-    agent: Agent
+    agent: Agent | None
     status: Literal[
-        "running", "completed", "needs_follow_up", "blocked", "failed"
-    ] = "running"
+        "queued",
+        "running",
+        "completed",
+        "needs_follow_up",
+        "blocked",
+        "failed",
+        "cancelled",
+    ] = "queued"
+    pending_request: str = ""
+    priority: int = 0
+    depends_on: tuple[str, ...] = ()
+    max_attempts: int = 1
+    attempts: int = 0
     latest_handoff: TaskHandoff | None = None
     error: str | None = None
     background_task: asyncio.Task[None] | None = field(
@@ -478,6 +495,9 @@ class ContextRuntime:
     assignments: dict[str, AssignmentSession] = field(default_factory=dict)
     evidence_records: dict[str, EvidenceRecord] = field(default_factory=dict)
     assignment_history: list[TaskHandoff] = field(default_factory=list)
+    pending_completion_events: list[AssignmentCompletionEvent] = field(
+        default_factory=list
+    )
     call_event_handler: Callable[[AgentCallEvent], None] | None = None
     assignment_completion_handler: (
         Callable[[AssignmentCompletionEvent], Awaitable[None]] | None
@@ -486,8 +506,23 @@ class ContextRuntime:
     validation_results_by_agent: dict[str, list[ValidationResult]] = field(
         default_factory=dict
     )
+    max_concurrent_assignments: int = 4
+    persistence_handler: Callable[["ContextRuntime"], None] | None = field(
+        default=None, repr=False
+    )
+    scheduler: "AssignmentScheduler | None" = field(default=None, repr=False)
     _next_call_id: int = 1
     _state_lock: LockType = field(default_factory=Lock, repr=False)
+
+    def __post_init__(self) -> None:
+        """拒绝无效的全局并发配置。"""
+        if self.max_concurrent_assignments <= 0:
+            raise ValueError("任务并发上限必须为正数")
+
+    def persist(self) -> None:
+        """在存在持久化边界时保存当前可恢复状态。"""
+        if self.persistence_handler is not None:
+            self.persistence_handler(self)
 
     def create_agent_context(
         self,
@@ -518,6 +553,7 @@ class ContextRuntime:
             coordinator_id=coordinator_id,
         )
         self.agent_contexts[agent_id] = agent_context
+        self.persist()
         return agent_context
 
     def render_agent_instructions(
@@ -591,6 +627,7 @@ class ContextRuntime:
         with self._state_lock:
             self.task_state.record_modified_file(path)
             self.modified_files_by_agent.setdefault(agent_id, []).append(path)
+        self.persist()
 
     def record_validation(
         self,
@@ -606,6 +643,7 @@ class ContextRuntime:
             self.validation_results_by_agent.setdefault(agent_id, []).append(
                 result
             )
+        self.persist()
 
     def record_handoff(self, handoff: TaskHandoff) -> None:
         """保存任务 Agent 的一轮交接，并同步任务分配的最新状态。"""
@@ -632,6 +670,7 @@ class ContextRuntime:
         session.status = handoff.status
         session.error = None
         self.assignment_history.append(handoff)
+        self.persist()
 
     def register_evidence(
         self,
@@ -659,6 +698,7 @@ class ContextRuntime:
                 content=content,
             )
             self.evidence_records[evidence_id] = evidence
+        self.persist()
         return evidence
 
     def resolve_fact_claims(
