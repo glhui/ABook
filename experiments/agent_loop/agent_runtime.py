@@ -4,14 +4,14 @@ from pydantic_ai import Agent, RunContext
 from pydantic_ai.models import Model
 from pydantic_ai.toolsets import FunctionToolset
 
-from .context import AgentContext, AgentDependencies, ContextRuntime
-from .orchestration import (
-    AGENT_TEMPLATES,
+from .assignment_models import (
     AssignmentSnapshot,
-    DEFAULT_AGENT_RUNNER,
     TaskAssignmentReceipt,
     TaskAssignmentRequest,
     TaskReport,
+)
+from .context import AgentContext, AgentDependencies, ContextRuntime
+from .orchestration import (
     assign_tasks,
     cancel_assignment,
     inspect_assignment,
@@ -22,6 +22,7 @@ from .orchestration import (
     update_task_state,
 )
 from .runner import AgentTurnResult
+from .task_agents import AGENT_TEMPLATES
 from .workspace_tools import RetryToolset, create_workspace_toolset
 
 
@@ -72,7 +73,9 @@ def create_coordinator_agent(model: Model) -> Agent[AgentDependencies, str]:
             "不得原样重试，应改用文件列表、读取或搜索工具。"
             "工作能够拆成范围明确、具有完成条件的工作包时调用 assign_tasks。"
             "该工具立即返回 queued 任务分配 ID；可使用 priority、depends_on 和 "
-            "max_attempts 表达调度约束。不要等待执行结果，应继续当前可独立推进的"
+            "max_attempts 表达调度约束。同一次调用中为任务设置 task_key 后，后续"
+            "任务可在 depends_on 引用该别名，以一次声明串行与并行混合的依赖图。"
+            "不要等待执行结果，应继续当前可独立推进的"
             "工作。Runtime 会合并临近完成事件后触发协调轮次。通过 "
             "list_assignments 或 inspect_assignment 查看进展；需要修正时调用 "
             "send_task_feedback，把具体反馈交回原执行 Agent；不再需要的排队或运行"
@@ -108,7 +111,7 @@ async def run_coordinator_turn(
 ) -> AgentTurnResult[str]:
     """通过统一 Runner 异步执行协调 Agent 的一轮调用。"""
     current_request = (request or agent_context.task).strip()
-    return await DEFAULT_AGENT_RUNNER.run_turn(
+    return await runtime.get_agent_runner().run_turn(
         agent, runtime, agent_context, current_request
     )
 

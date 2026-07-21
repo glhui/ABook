@@ -192,11 +192,8 @@ class RuntimeStateStore:
             validation_results=list(task.validation_results),
             status=task.status,
         )
-        runtime = ContextRuntime(
-            workspace,
-            task_state,
-            max_concurrent_assignments=snapshot.max_concurrent_assignments,
-        )
+        runtime = ContextRuntime(workspace, task_state)
+        runtime.max_concurrent_assignments = snapshot.max_concurrent_assignments
         skill_runtime = SkillRuntime(Path(workspace.skills_root))
         for record in snapshot.agent_contexts:
             runtime.agent_contexts[record.agent_id] = AgentContext(

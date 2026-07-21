@@ -33,14 +33,19 @@
 
 ~~~text
 agent_loop/
-├─ context.py          共享工作区上下文、AgentContext 和 ContextRuntime
+├─ context.py          共享工作区上下文、AgentContext 和轻量 Runtime 门面
+├─ registries.py       任务会话、交接历史和待处理事件注册表
+├─ event_bus.py        支持多个宿主订阅者的同步与异步事件通道
 ├─ workspace_tools.py  文件工具、PowerShell 工具和统一重试边界
 ├─ runner.py           协调 Agent 与任务 Agent 共用的调用生命周期
-├─ orchestration.py    Skill、任务分配和结构化交接工具
+├─ assignment_models.py 任务分配请求、回执和结构化报告模型
+├─ task_agents.py      固定任务模板与任务 Agent 工厂
+├─ orchestration.py    Skill、任务分配服务和结构化交接工具
 ├─ scheduler.py        优先级、依赖、重试、取消和全局并发调度
 ├─ persistence.py      版本化 Runtime JSON 快照与恢复
 ├─ agent_runtime.py    协调 Agent 定义和异步调用入口
-├─ main.py             模型配置与命令行入口
+├─ conversation.py     事件合批、协调续跑和会话生命周期
+├─ main.py             模型配置与命令行启动入口
 └─ skills/             可按需加载的 Skill
 ~~~
 
@@ -163,8 +168,12 @@ runtime 的命令边界；因此需要分支或工作区状态时，Agent 应通
 分配工具，只能使用模板允许的工作区工具。`assign_tasks` 立即返回 `queued` 状态
 和 `assignment_id`，不会等待执行完成。
 
-每个请求可以设置 `priority`、`depends_on` 和 `max_attempts`。调度器在下一事件
-循环周期统一选择就绪任务，先运行较高优先级任务，并把全局并发限制在 Runtime 的
+每个请求可以设置 `priority`、`depends_on` 和 `max_attempts`。在同一次
+`assign_tasks` 调用中，还可为每项设置唯一的 `task_key`，并让后续任务在
+`depends_on` 中引用该别名；Runtime 会在入队前解析为实际任务 ID，并拒绝重复
+别名、未知依赖和循环依赖。因此可以一次表达“需求分析和测试设计并行，二者完成后
+代码实现和测试编写并行”的混合调度图。调度器在下一事件循环周期统一选择就绪任务，
+先运行较高优先级任务，并把全局并发限制在 Runtime 的
 `max_concurrent_assignments`（默认 4）以内。依赖只有进入 `completed` 才会释放
 后续任务；依赖失败、阻塞或取消时，后续任务会明确进入 `blocked`。执行异常按
 `max_attempts` 重试。协调 Agent 可用 `cancel_assignment` 取消排队或运行中的任务。
@@ -190,7 +199,14 @@ Runtime 会串行化保存请求；每次保存使用唯一临时文件，Window
 后台任务使用 CLI 的持续事件循环并发执行。Runtime 会把短时间内完成、失败、阻塞
 或取消的事件合并成一个批次，再触发一轮协调调用，避免同批任务逐个造成重复规划。
 协调 Agent 根据该批交接统一更新计划。并行 worker 必须修改不同文件。Runtime 按
-Agent 单独记录修改和验证，避免错误归属副作用。当前未增加额外的任务执行超时。
+Agent 单独记录修改和验证，避免错误归属副作用。协调续跑遇到瞬时异常时执行三次
+有界退避重试；耗尽后保留完成事件，以便下次启动恢复。当前未增加额外的任务执行
+超时。
+
+调用状态和任务完成状态通过独立事件通道广播。CLI、测试和监控可以同时订阅，关闭
+会话时只移除本会话注册的处理器，不再保存并覆盖 Runtime 的单一回调。调度器依赖
+统一的 `AssignmentExecutor` 协议，因此任务执行方式不再限定为 PydanticAI Agent。
+每个 Runtime 也拥有自己的 `AgentRunner`，可独立配置调用限制或注入测试替身。
 
 ## 运行
 

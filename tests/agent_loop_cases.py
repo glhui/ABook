@@ -36,8 +36,11 @@ from experiments.agent_loop.agent_runtime import (
     update_task_state,
 )
 from experiments.agent_loop.context import (
+    AgentCallEvent,
     AgentContext,
     AgentDependencies,
+    AssignmentCompletionEvent,
+    AssignmentSession,
     ContextWindowPolicy,
     ContextRuntime,
     EvidenceQuoteClaim,
@@ -48,12 +51,14 @@ from experiments.agent_loop.context import (
     WorkspaceContext,
     WorkspaceContextBuilder,
 )
+from experiments.agent_loop.conversation import ConversationSession
 from experiments.agent_loop.main import (
     DeepSeekThinkingChatModel,
     run_conversation,
 )
 from experiments.agent_loop.persistence import RuntimeStateStore
 from experiments.agent_loop.runner import AgentCallLimits, AgentRunner
+from experiments.agent_loop.scheduler import AssignmentScheduler
 from experiments.agent_loop.workspace_tools import (
     RecoverableToolError,
     WorkspaceTextEdit,
@@ -318,6 +323,33 @@ class WorkspaceContextBuilderTests(unittest.TestCase):
         self.assertNotIn("second.txt", first_prompt)
         self.assertIn("first.txt", coordinator_prompt)
         self.assertIn("second.txt", coordinator_prompt)
+
+    def test_runtime_event_channels_support_multiple_subscribers(self) -> None:
+        """日志和宿主可同时订阅事件，取消一方不会覆盖另一方。"""
+        runtime = ContextRuntime(
+            WorkspaceContextBuilder(
+                self.workspace_root, self.skills_root
+            ).build(),
+            TaskState(goal="广播事件"),
+        )
+        first_events: list[AgentCallEvent] = []
+        second_events: list[AgentCallEvent] = []
+        unsubscribe_first = runtime.call_events.subscribe(first_events.append)
+        runtime.call_events.subscribe(second_events.append)
+        event = AgentCallEvent(
+            call_id=1,
+            agent_id="coordinator",
+            kind="agent",
+            phase="started",
+            turn_index=1,
+        )
+
+        runtime.emit_call_event(event)
+        unsubscribe_first()
+        runtime.emit_call_event(event)
+
+        self.assertEqual([event], first_events)
+        self.assertEqual([event, event], second_events)
 
 
 class AgentRuntimeTests(unittest.TestCase):
@@ -722,7 +754,7 @@ class AgentRuntimeTests(unittest.TestCase):
                 AgentCallLimits(request_limit=1, tool_calls_limit=10)
             )
             call_events = []
-            runtime.call_event_handler = call_events.append
+            runtime.call_events.subscribe(call_events.append)
 
             with self.assertRaises(UsageLimitExceeded):
                 asyncio.run(
@@ -741,6 +773,54 @@ class AgentRuntimeTests(unittest.TestCase):
             [event.phase for event in call_events],
         )
         self.assertIn("UsageLimitExceeded", call_events[-1].detail)
+
+    def test_runtime_uses_injected_agent_runner(self) -> None:
+        """每个 Runtime 可拥有独立 Runner，不依赖模块级共享单例。"""
+        with tempfile.TemporaryDirectory() as workspace_directory:
+            runtime, _coordinator_context = create_test_runtime(
+                Path(workspace_directory)
+            )
+            runner = AgentRunner(
+                AgentCallLimits(request_limit=2, tool_calls_limit=3)
+            )
+            runtime.agent_runner = runner
+
+            self.assertIs(runner, runtime.get_agent_runner())
+
+    def test_assignment_followup_retries_before_retaining_event(self) -> None:
+        """协调自动续跑使用有界重试，并在瞬时失败恢复后返回结果。"""
+        attempts = 0
+
+        def model_function(_messages, _agent_info):
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise RuntimeError("temporary coordinator failure")
+            return ModelResponse(parts=[TextPart("已恢复")])
+
+        with tempfile.TemporaryDirectory() as workspace_directory:
+            runtime, coordinator_context = create_test_runtime(
+                Path(workspace_directory)
+            )
+            session = ConversationSession(
+                create_coordinator_agent(FunctionModel(model_function)),
+                runtime,
+                coordinator_context,
+                input_fn=lambda _prompt: "/quit",
+                output_fn=lambda _message: None,
+            )
+            event = AssignmentCompletionEvent(
+                assignment_id="worker-1",
+                coordinator_id=coordinator_context.agent_id,
+                status="completed",
+            )
+
+            turn = asyncio.run(session._resume_coordinator([event]))
+
+        self.assertIsNotNone(turn)
+        assert turn is not None
+        self.assertEqual("已恢复", turn.output)
+        self.assertEqual(3, attempts)
 
     def test_context_compacts_at_seventy_percent_of_one_million_tokens(
         self,
@@ -806,7 +886,7 @@ class AgentRuntimeTests(unittest.TestCase):
                 window_tokens=20, compaction_ratio=0.70
             )
             call_events = []
-            runtime.call_event_handler = call_events.append
+            runtime.call_events.subscribe(call_events.append)
 
             turn = asyncio.run(
                 AgentRunner().run_turn(
@@ -1638,7 +1718,7 @@ class TaskCoordinationTests(unittest.TestCase):
             )
 
         call_events = []
-        self.runtime.call_event_handler = call_events.append
+        self.runtime.call_events.subscribe(call_events.append)
         async def run_scenario():
             receipts = await assign_tasks(
                 SimpleNamespace(
@@ -1913,7 +1993,7 @@ class TaskCoordinationTests(unittest.TestCase):
             raise RuntimeError("task model failed")
 
         async def run_scenario():
-            self.runtime.assignment_completion_handler = completion_handler
+            self.runtime.assignment_events.subscribe(completion_handler)
             receipt = (
                 await assign_tasks(
                     SimpleNamespace(
@@ -2033,6 +2113,133 @@ class TaskCoordinationTests(unittest.TestCase):
         asyncio.run(run_scenario())
         self.assertEqual(["first-1", "first-2", "dependent"], execution_order)
         self.assertEqual("completed", self.runtime.assignments["reviewer-1"].status)
+
+    def test_scheduler_blocks_missing_restored_dependency(self) -> None:
+        """损坏快照中的未知依赖会变为 blocked，而不会抛出 KeyError。"""
+        completion_events: list[AssignmentCompletionEvent] = []
+
+        async def completion_handler(event: AssignmentCompletionEvent) -> None:
+            completion_events.append(event)
+
+        async def executor(
+            assignment: AssignmentSession, request: str
+        ) -> AssignmentCompletionEvent:
+            self.fail("缺少依赖的任务不应进入执行器")
+
+        async def run_scenario() -> AssignmentSession:
+            assignment = AssignmentSession(
+                assignment_id="reviewer-1",
+                coordinator_id=self.coordinator_context.agent_id,
+                agent_id="reviewer-1",
+                template="reviewer",
+                agent=None,
+                depends_on=("missing-1",),
+            )
+            self.runtime.assignments[assignment.assignment_id] = assignment
+            self.runtime.assignment_events.subscribe(completion_handler)
+            scheduler = AssignmentScheduler(self.runtime, executor)
+            scheduler.enqueue(assignment, "检查恢复任务")
+            assert assignment.background_task is not None
+            await assignment.background_task
+            return assignment
+
+        assignment = asyncio.run(run_scenario())
+
+        self.assertEqual("blocked", assignment.status)
+        self.assertIn("依赖任务不存在", assignment.error)
+        self.assertEqual("blocked", completion_events[0].status)
+
+    def test_batch_task_keys_schedule_mixed_serial_and_parallel_work(self) -> None:
+        """同批别名可表达前置阶段与其后的并行实现、测试分支。"""
+        started_tasks: list[str] = []
+
+        async def task_model_function(messages, agent_info):
+            serialized = ModelMessagesTypeAdapter.dump_json(messages).decode()
+            task_name = next(
+                name
+                for name in ("需求分析", "测试设计", "代码实现", "测试编写")
+                if name in serialized
+            )
+            started_tasks.append(task_name)
+            if task_name in {"需求分析", "测试设计"}:
+                await asyncio.sleep(0.01)
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name=agent_info.output_tools[0].name,
+                args={"status": "completed", "summary": "完成"},
+            )])
+
+        async def run_scenario() -> tuple:
+            receipts = await assign_tasks(
+                SimpleNamespace(
+                    deps=self.dependencies,
+                    model=FunctionModel(task_model_function),
+                ),
+                tasks=[
+                    TaskAssignmentRequest(
+                        template="explorer", task="需求分析", task_key="analysis"
+                    ),
+                    TaskAssignmentRequest(
+                        template="reviewer", task="测试设计", task_key="test_design"
+                    ),
+                    TaskAssignmentRequest(
+                        template="worker",
+                        task="代码实现",
+                        task_key="implementation",
+                        depends_on=["analysis", "test_design"],
+                    ),
+                    TaskAssignmentRequest(
+                        template="worker",
+                        task="测试编写",
+                        depends_on=["analysis", "test_design"],
+                    ),
+                ],
+            )
+            await asyncio.gather(*[
+                self.runtime.assignments[receipt.assignment_id].background_task
+                for receipt in receipts
+            ])
+            return receipts
+
+        receipts = asyncio.run(run_scenario())
+
+        self.assertEqual({"需求分析", "测试设计"}, set(started_tasks[:2]))
+        self.assertEqual({"代码实现", "测试编写"}, set(started_tasks[2:]))
+        self.assertTrue(all(
+            self.runtime.assignments[receipt.assignment_id].status == "completed"
+            for receipt in receipts
+        ))
+        code_assignment = self.runtime.assignments[receipts[2].assignment_id]
+        self.assertEqual(
+            (receipts[0].assignment_id, receipts[1].assignment_id),
+            code_assignment.depends_on,
+        )
+
+    def test_batch_task_keys_reject_cyclic_dependencies_before_enqueue(self) -> None:
+        """循环别名不会创建永远无法被调度器释放的后台任务。"""
+        tool_context = SimpleNamespace(
+            deps=self.dependencies,
+            model=TestModel(call_tools=[]),
+        )
+
+        with self.assertRaisesRegex(RecoverableToolError, "循环"):
+            asyncio.run(assign_tasks(
+                tool_context,
+                tasks=[
+                    TaskAssignmentRequest(
+                        template="explorer",
+                        task="任务 A",
+                        task_key="task_a",
+                        depends_on=["task_b"],
+                    ),
+                    TaskAssignmentRequest(
+                        template="reviewer",
+                        task="任务 B",
+                        task_key="task_b",
+                        depends_on=["task_a"],
+                    ),
+                ],
+            ))
+        self.assertEqual({}, self.runtime.assignments)
 
     def test_runtime_snapshot_recovers_interrupted_assignment(self) -> None:
         """快照保留历史和调度元数据，并把中断运行转换为排队。"""

@@ -6,13 +6,17 @@ from _thread import LockType
 from pathlib import Path
 import re
 from threading import Lock
-from typing import TYPE_CHECKING, Awaitable, Callable, Literal
+from typing import TYPE_CHECKING, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
 
+from .event_bus import AsyncEventChannel, SyncEventChannel
+from .registries import AssignmentRegistry
+
 if TYPE_CHECKING:
+    from .runner import AgentRunner
     from .scheduler import AssignmentScheduler
 
 
@@ -492,16 +496,16 @@ class ContextRuntime:
         default_factory=ContextWindowPolicy
     )
     agent_contexts: dict[str, AgentContext] = field(default_factory=dict)
-    assignments: dict[str, AssignmentSession] = field(default_factory=dict)
     evidence_records: dict[str, EvidenceRecord] = field(default_factory=dict)
-    assignment_history: list[TaskHandoff] = field(default_factory=list)
-    pending_completion_events: list[AssignmentCompletionEvent] = field(
-        default_factory=list
+    assignment_registry: AssignmentRegistry[
+        AssignmentSession, TaskHandoff, AssignmentCompletionEvent
+    ] = field(default_factory=AssignmentRegistry)
+    call_events: SyncEventChannel[AgentCallEvent] = field(
+        default_factory=SyncEventChannel, repr=False
     )
-    call_event_handler: Callable[[AgentCallEvent], None] | None = None
-    assignment_completion_handler: (
-        Callable[[AssignmentCompletionEvent], Awaitable[None]] | None
-    ) = None
+    assignment_events: AsyncEventChannel[AssignmentCompletionEvent] = field(
+        default_factory=AsyncEventChannel, repr=False
+    )
     modified_files_by_agent: dict[str, list[str]] = field(default_factory=dict)
     validation_results_by_agent: dict[str, list[ValidationResult]] = field(
         default_factory=dict
@@ -512,19 +516,48 @@ class ContextRuntime:
     validated_revisions_by_agent: dict[str, int] = field(
         default_factory=dict
     )
-    max_concurrent_assignments: int = 4
     persistence_handler: Callable[["ContextRuntime"], None] | None = field(
         default=None, repr=False
     )
     scheduler: "AssignmentScheduler | None" = field(default=None, repr=False)
+    agent_runner: "AgentRunner | None" = field(default=None, repr=False)
     _next_call_id: int = 1
     _state_lock: LockType = field(default_factory=Lock, repr=False)
     _persistence_lock: LockType = field(default_factory=Lock, repr=False)
 
-    def __post_init__(self) -> None:
-        """拒绝无效的全局并发配置。"""
-        if self.max_concurrent_assignments <= 0:
-            raise ValueError("任务并发上限必须为正数")
+    @property
+    def assignments(self) -> dict[str, AssignmentSession]:
+        """提供任务会话兼容视图；所有权位于 ``assignment_registry``。"""
+        return self.assignment_registry.sessions
+
+    @property
+    def assignment_history(self) -> list[TaskHandoff]:
+        """提供可恢复交接历史的兼容视图。"""
+        return self.assignment_registry.history
+
+    @assignment_history.setter
+    def assignment_history(self, value: list[TaskHandoff]) -> None:
+        self.assignment_registry.history = value
+
+    @property
+    def pending_completion_events(self) -> list[AssignmentCompletionEvent]:
+        """提供尚未由协调 Agent 确认的完成事件兼容视图。"""
+        return self.assignment_registry.pending_events
+
+    @pending_completion_events.setter
+    def pending_completion_events(
+        self, value: list[AssignmentCompletionEvent]
+    ) -> None:
+        self.assignment_registry.pending_events = value
+
+    @property
+    def max_concurrent_assignments(self) -> int:
+        """返回任务注册表维护的全局并发上限。"""
+        return self.assignment_registry.max_concurrent
+
+    @max_concurrent_assignments.setter
+    def max_concurrent_assignments(self, value: int) -> None:
+        self.assignment_registry.set_max_concurrent(value)
 
     def persist(self) -> None:
         """串行保存可恢复状态，允许同步工具从多个工作线程调用。"""
@@ -533,6 +566,18 @@ class ContextRuntime:
             return
         with self._persistence_lock:
             handler(self)
+
+    def get_agent_runner(self) -> "AgentRunner":
+        """返回当前 Runtime 私有 Runner，并在首次使用时按需创建。
+
+        Runner 不再由模块级全局单例共享，因此不同 Runtime 可以独立设置模型请求
+        限制或在测试中注入替身，同时避免在 ``context`` 导入阶段形成循环依赖。
+        """
+        if self.agent_runner is None:
+            from .runner import AgentRunner
+
+            self.agent_runner = AgentRunner()
+        return self.agent_runner
 
     def create_agent_context(
         self,
@@ -628,9 +673,14 @@ class ContextRuntime:
         return call_id
 
     def emit_call_event(self, event: AgentCallEvent) -> None:
-        """把调用生命周期事件同步交给可选宿主处理器。"""
-        if self.call_event_handler is not None:
-            self.call_event_handler(event)
+        """把调用生命周期事件同步广播给所有宿主订阅者。"""
+        self.call_events.publish(event)
+
+    async def emit_assignment_event(
+        self, event: AssignmentCompletionEvent
+    ) -> None:
+        """把任务完成事件异步广播给所有宿主订阅者。"""
+        await self.assignment_events.publish(event)
 
     def record_modified_file(self, path: str, agent_id: str) -> None:
         """同时记录全局修改状态和执行该修改的 Agent，供并行交接归属。"""

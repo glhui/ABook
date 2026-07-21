@@ -2,7 +2,7 @@
 
 import asyncio
 import heapq
-from collections.abc import Awaitable, Callable
+from typing import Protocol
 
 from .context import (
     AssignmentCompletionEvent,
@@ -11,9 +11,18 @@ from .context import (
 )
 
 
-AssignmentExecutor = Callable[
-    [AssignmentSession, str], Awaitable[AssignmentCompletionEvent]
-]
+class AssignmentExecutor(Protocol):
+    """执行一种任务会话并返回统一完成事件的可替换协议。
+
+    调度器只依赖该协议，不要求任务必须由 PydanticAI Agent 完成；后续可以注入
+    本地脚本、静态分析或人工审批执行器，而不修改优先级和依赖调度算法。
+    """
+
+    async def __call__(
+        self, assignment: AssignmentSession, request: str
+    ) -> AssignmentCompletionEvent:
+        """执行一轮任务并返回其最终事件。"""
+        ...
 
 
 class AssignmentScheduler:
@@ -112,21 +121,34 @@ class AssignmentScheduler:
             assignment = self.runtime.assignments[entry[2]]
             if assignment.status != "queued":
                 continue
-            dependency_states = [
-                self.runtime.assignments[dependency].status
+            dependency_sessions = {
+                dependency: self.runtime.assignments.get(dependency)
                 for dependency in assignment.depends_on
+            }
+            missing_dependencies = [
+                dependency
+                for dependency, session in dependency_sessions.items()
+                if session is None
             ]
             failed_dependencies = [
                 dependency
-                for dependency in assignment.depends_on
-                if self.runtime.assignments[dependency].status
-                in {"failed", "blocked", "cancelled"}
+                for dependency, session in dependency_sessions.items()
+                if session is not None
+                and session.status in {"failed", "blocked", "cancelled"}
             ]
-            if failed_dependencies:
+            if missing_dependencies or failed_dependencies:
                 assignment.status = "blocked"
-                assignment.error = (
-                    "依赖任务未成功完成：" + ", ".join(failed_dependencies)
-                )
+                reasons: list[str] = []
+                if missing_dependencies:
+                    reasons.append(
+                        "依赖任务不存在：" + ", ".join(missing_dependencies)
+                    )
+                if failed_dependencies:
+                    reasons.append(
+                        "依赖任务未成功完成："
+                        + ", ".join(failed_dependencies)
+                    )
+                assignment.error = "；".join(reasons)
                 asyncio.create_task(
                     self._finish(
                         assignment,
@@ -139,7 +161,10 @@ class AssignmentScheduler:
                     )
                 )
                 continue
-            if any(state != "completed" for state in dependency_states):
+            if any(
+                session is not None and session.status != "completed"
+                for session in dependency_sessions.values()
+            ):
                 deferred.append(entry)
                 continue
             assignment.status = "running"
@@ -187,13 +212,11 @@ class AssignmentScheduler:
         waiter = self._waiters.pop(assignment.assignment_id, None)
         if waiter is not None and not waiter.done():
             waiter.set_result(None)
-        handler = self.runtime.assignment_completion_handler
-        if handler is not None:
-            try:
-                await handler(event)
-            except Exception as error:
-                assignment.error = (
-                    "协调 Agent 自动续跑失败："
-                    f"{type(error).__name__}: {error}"
-                )
-                self.runtime.persist()
+        try:
+            await self.runtime.emit_assignment_event(event)
+        except Exception as error:
+            assignment.error = (
+                "协调 Agent 自动续跑失败："
+                f"{type(error).__name__}: {error}"
+            )
+            self.runtime.persist()
