@@ -113,7 +113,16 @@ class ValidationResult(BaseModel):
     exit_code: int | None
     timed_out: bool
 
-
+'''
+工具执行成功后，会调用
+evidence = ctx_runtime.register_evidence(
+    kind="file_read",
+    relative_path="src/main.py",
+    detail="lines 10-20",
+    result="def foo():\n    return 'bar'\n",
+    agent_id=agent_context.agent_id,
+)来执行。
+'''
 class EvidenceRecord(BaseModel):
     """由工作区工具登记、可供任务事实引用的一条证据。
 
@@ -124,18 +133,18 @@ class EvidenceRecord(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    evidence_id: str
-    agent_id: str
+    evidence_id: str # Runtime 分配的唯一 ID
+    agent_id: str # 登记该证据的 Agent ID
     kind: Literal[
         "file_listing",
         "file_read",
         "text_search",
         "file_change",
         "command",
-    ]
-    source: str
-    detail: str
-    content: str
+    ] # 证据类型
+    source: str # 证据来自哪里。
+    detail: str # 保存更具体的定位信息，例如行号、读取范围或命令退出状态。
+    content: str # 工具实际返回的有界文本，供 Runtime 校验事实引用的原文。
 
 
 class EvidenceQuoteClaim(BaseModel):
@@ -281,15 +290,15 @@ class TaskState:
     调用确定性记录，避免模型把未发生的操作写成已经完成的事实。
     """
 
-    goal: str
-    plan: list[str] = field(default_factory=list)
-    completed_steps: list[str] = field(default_factory=list)
-    important_facts: list[TaskFact] = field(default_factory=list)
-    unresolved_issues: list[str] = field(default_factory=list)
-    completion_criteria: list[str] = field(default_factory=list)
-    modified_files: list[str] = field(default_factory=list)
-    validation_results: list[ValidationResult] = field(default_factory=list)
-    status: Literal["in_progress", "complete", "blocked"] = "in_progress"
+    goal: str # 任务目标
+    plan: list[str] = field(default_factory=list) # 任务计划
+    completed_steps: list[str] = field(default_factory=list) # 已完成的步骤
+    important_facts: list[TaskFact] = field(default_factory=list) # 从工具实际返回结果中提取出来、并且带有可验证证据引用的重要事实，不是压缩摘要中的所有内容。
+    unresolved_issues: list[str] = field(default_factory=list) # 任务 Agent 在执行过程中发现的、需要进一步调查或解决的问题。
+    completion_criteria: list[str] = field(default_factory=list) # 任务完成的条件或验收标准，由协调 Agent 明确指定。
+    modified_files: list[str] = field(default_factory=list) # 任务 Agent 实际修改过的文件路径列表，由 Runtime 记录，避免模型虚构。
+    validation_results: list[ValidationResult] = field(default_factory=list) # 任务 Agent 实际执行过的测试、编译或依赖检查结果，由 Runtime 记录，避免模型虚构。
+    status: Literal["in_progress", "complete", "blocked"] = "in_progress" # 任务当前状态，由协调 Agent 明确更新。
 
     def __post_init__(self) -> None:
         """规范化目标，并拒绝没有实际任务的状态。"""
