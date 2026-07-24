@@ -8,7 +8,14 @@ import re
 from threading import Lock
 from typing import TYPE_CHECKING, Callable, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    model_validator,
+)
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
 
@@ -96,63 +103,85 @@ class WorkspaceContext(BaseModel):
         )
 
 
-class ValidationResult(BaseModel):
-    """一次实际运行的验证命令的结果摘要。
+class CommandCallRecord(BaseModel):
+    """一次验证命令的轻量执行状态。
 
-    仅当 ``run_powershell_command`` 执行 Python 测试、编译或 ``pip check``
-    时由宿主写入 TaskState，模型不能自行创建此记录。例如，执行
-    ``python -m unittest discover -s tests -v`` 并成功结束时，记录的
-    ``command`` 为该命令、``exit_code`` 为 ``0``、``timed_out`` 为 ``False``。
-    超时的命令没有退出码，因此 ``exit_code`` 为 ``None`` 且 ``timed_out``
-    为 ``True``。
+    ``ToolCallRecord`` 保存任意工具调用的结果文本与来源；本模型只为 ``TaskState``
+    汇总测试、编译和 ``pip check`` 的命令、退出码与超时状态，不保存完整输出。
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    command: str
-    exit_code: int | None
-    timed_out: bool
+    command: str  # 例如："python -m unittest discover -s tests -v"
+    exit_code: int | None  # 例如：成功为 0；超时时为 None。
+    timed_out: bool  # 例如：命令超过宿主设定时限时为 True。
 
-'''
-工具执行成功后，会调用
-evidence = ctx_runtime.register_evidence(
-    kind="file_read",
-    relative_path="src/main.py",
-    detail="lines 10-20",
-    result="def foo():\n    return 'bar'\n",
-    agent_id=agent_context.agent_id,
-)来执行。
-'''
-class EvidenceRecord(BaseModel):
-    """由工作区工具登记、可供任务事实引用的一条证据。
+class ToolCallRecord(BaseModel):
+    """一次由宿主完成的工具调用及其可引用结果。
 
-    ``evidence_id`` 由 Runtime 分配，模型只能引用已经存在的 ID。``source``
-    标识文件、目录或命令，``detail`` 保存行号、读取范围或退出状态等定位信息，
-    ``content`` 保存工具实际返回的有界文本，供 Runtime 校验事实引用的原文。
+    Runtime 只在工具已产生结果时创建此记录。成功调用的结果通常比模型猜测更
+    可信，因此可以被后续事实逐字引用；但可信不代表它必然是当前任务最有用、最
+    完整或足以支持结论的上下文，Agent 仍须按任务选择结果并给出精确引用。
+
+    ``request`` 保存宿主实际接受的结构化请求，``result_content`` 是实际返回给模型
+    的有界内容。模型不能自行创建记录；事实引用必须由 Runtime 在结果字段中校验
+    原文。来源、协议或外部资源等专门元数据暂不在该基础模型中建模。
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    evidence_id: str # Runtime 分配的唯一 ID
-    agent_id: str # 登记该证据的 Agent ID
-    kind: Literal[
-        "file_listing",
-        "file_read",
-        "text_search",
-        "file_change",
-        "command",
-    ] # 证据类型
-    source: str # 证据来自哪里。
-    detail: str # 保存更具体的定位信息，例如行号、读取范围或命令退出状态。
-    content: str # 工具实际返回的有界文本，供 Runtime 校验事实引用的原文。
+    tool_call_id: str = Field(min_length=1, max_length=100)
+    agent_id: str = Field(min_length=1, max_length=100)
+    tool_name: str = Field(min_length=1, max_length=200)
+    status: Literal["succeeded", "timed_out"]
+    request: dict[str, JsonValue] = Field(default_factory=dict)
+    result_content: str
+    result_truncated: bool
+
+    @property
+    def evidence_id(self) -> str:
+        """提供旧调用方读取工具调用 ID 的兼容属性。"""
+        return self.tool_call_id
+
+    @property
+    def content(self) -> str:
+        """提供旧调用方读取可引用结果文本的兼容属性。"""
+        return self.result_content
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_evidence_record(cls, value: object) -> object:
+        """兼容读取 v1/v2 快照中的扁平 ``EvidenceRecord`` 数据。"""
+        if not isinstance(value, dict) or "evidence_id" not in value:
+            return value
+        legacy_kind = str(value["kind"])
+        detail = str(value["detail"])
+        content = str(value["content"])
+        return {
+            "tool_call_id": value["evidence_id"],
+            "agent_id": value["agent_id"],
+            "tool_name": legacy_kind,
+            "status": "timed_out" if "timed out" in detail else "succeeded",
+            "request": {
+                "legacy_kind": legacy_kind,
+                "legacy_source": value["source"],
+                "legacy_detail": detail,
+            },
+            "result_content": content,
+            "result_truncated": "truncated" in content.casefold(),
+        }
 
 
 class EvidenceQuoteClaim(BaseModel):
-    """模型对一条宿主证据的引用及其逐字摘录。"""
+    """模型对一条工具调用结果的引用及其逐字摘录。"""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, validate_by_name=True
+    )
 
-    evidence_id: str
+    tool_call_id: str = Field(
+        validation_alias=AliasChoices("tool_call_id", "evidence_id")
+    )
     quote: str = Field(min_length=1, max_length=2_000)
 
 
@@ -166,11 +195,11 @@ class FactClaim(BaseModel):
 
 
 class EvidenceCitation(BaseModel):
-    """已经由 Runtime 验证原文确实存在的证据引用。"""
+    """已经由 Runtime 验证原文确实存在的工具调用结果引用。"""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    record: EvidenceRecord
+    record: ToolCallRecord
     quote: str
 
 
@@ -197,9 +226,9 @@ class TaskHandoff(BaseModel):
     status: Literal["completed", "needs_follow_up", "blocked"]
     summary: str
     facts: tuple[TaskFact, ...]
-    evidence: tuple[EvidenceRecord, ...]
+    evidence: tuple[ToolCallRecord, ...]
     modified_files: tuple[str, ...]
-    validation_results: tuple[ValidationResult, ...]
+    validation_results: tuple[CommandCallRecord, ...]
     unresolved_issues: tuple[str, ...]
     recommended_next_actions: tuple[str, ...]
     compacted: bool
@@ -297,7 +326,8 @@ class TaskState:
     unresolved_issues: list[str] = field(default_factory=list) # 任务 Agent 在执行过程中发现的、需要进一步调查或解决的问题。
     completion_criteria: list[str] = field(default_factory=list) # 任务完成的条件或验收标准，由协调 Agent 明确指定。
     modified_files: list[str] = field(default_factory=list) # 任务 Agent 实际修改过的文件路径列表，由 Runtime 记录，避免模型虚构。
-    validation_results: list[ValidationResult] = field(default_factory=list) # 任务 Agent 实际执行过的测试、编译或依赖检查结果，由 Runtime 记录，避免模型虚构。
+    # 仅记录实际执行过的验证命令调用状态，不重复保存完整 stdout/stderr。
+    validation_results: list[CommandCallRecord] = field(default_factory=list)
     status: Literal["in_progress", "complete", "blocked"] = "in_progress" # 任务当前状态，由协调 Agent 明确更新。
 
     def __post_init__(self) -> None:
@@ -317,9 +347,9 @@ class TaskState:
         exit_code: int | None,
         timed_out: bool,
     ) -> None:
-        """记录实际执行过的测试、编译或依赖检查结果。"""
+        """记录实际执行过的测试、编译或依赖检查命令调用状态。"""
         self.validation_results.append(
-            ValidationResult(
+            CommandCallRecord(
                 command=command,
                 exit_code=exit_code,
                 timed_out=timed_out,
@@ -332,7 +362,7 @@ class TaskState:
             (
                 fact.statement,
                 tuple(
-                    (citation.record.evidence_id, citation.quote)
+                    (citation.record.tool_call_id, citation.quote)
                     for citation in fact.evidence
                 ),
             )
@@ -342,7 +372,7 @@ class TaskState:
             key = (
                 fact.statement,
                 tuple(
-                    (citation.record.evidence_id, citation.quote)
+                    (citation.record.tool_call_id, citation.quote)
                     for citation in fact.evidence
                 ),
             )
@@ -375,8 +405,8 @@ class TaskState:
         facts = [
             f"{fact.statement} [证据: "
             + "; ".join(
-                f"{citation.record.evidence_id} "
-                f"{citation.record.source} ({citation.record.detail}); "
+                f"{citation.record.tool_call_id} "
+                f"({citation.record.tool_name}); "
                 f"原文={citation.quote!r}"
                 for citation in fact.evidence
             )
@@ -505,7 +535,7 @@ class ContextRuntime:
         default_factory=ContextWindowPolicy
     )
     agent_contexts: dict[str, AgentContext] = field(default_factory=dict)
-    evidence_records: dict[str, EvidenceRecord] = field(default_factory=dict)
+    tool_call_records: dict[str, ToolCallRecord] = field(default_factory=dict)
     assignment_registry: AssignmentRegistry[
         AssignmentSession, TaskHandoff, AssignmentCompletionEvent
     ] = field(default_factory=AssignmentRegistry)
@@ -516,7 +546,8 @@ class ContextRuntime:
         default_factory=AsyncEventChannel, repr=False
     )
     modified_files_by_agent: dict[str, list[str]] = field(default_factory=dict)
-    validation_results_by_agent: dict[str, list[ValidationResult]] = field(
+    # 按 Agent 索引验证命令调用状态，供任务交接切分本轮实际验证记录。
+    validation_results_by_agent: dict[str, list[CommandCallRecord]] = field(
         default_factory=dict
     )
     modification_revisions_by_agent: dict[str, int] = field(
@@ -538,6 +569,11 @@ class ContextRuntime:
     def assignments(self) -> dict[str, AssignmentSession]:
         """提供任务会话兼容视图；所有权位于 ``assignment_registry``。"""
         return self.assignment_registry.sessions
+
+    @property
+    def evidence_records(self) -> dict[str, ToolCallRecord]:
+        """兼容旧调用方；新代码应使用 ``tool_call_records``。"""
+        return self.tool_call_records
 
     @property
     def assignment_history(self) -> list[TaskHandoff]:
@@ -634,10 +670,10 @@ class ContextRuntime:
     def render_runtime_state(self, agent_context: AgentContext) -> str:
         """按调用 Agent 的可见范围渲染可变状态数据。"""
         is_coordinator = agent_context.role == "coordinator"
-        evidence_catalog = "\n".join(
-            f"- {record.evidence_id}: agent={record.agent_id}; "
-            f"kind={record.kind}; source={record.source}; {record.detail}"
-            for record in self.evidence_records.values()
+        tool_call_catalog = "\n".join(
+            f"- {record.tool_call_id}: agent={record.agent_id}; "
+            f"tool={record.tool_name}; status={record.status}"
+            for record in self.tool_call_records.values()
             if is_coordinator or record.agent_id == agent_context.agent_id
         ) or "- 无"
         handoff_catalog = "\n".join(
@@ -648,7 +684,7 @@ class ContextRuntime:
         ) or "- 无"
         return (
             f"{self.task_state.render()}\n\n"
-            f"证据目录：\n{evidence_catalog}\n\n"
+            f"工具调用结果目录：\n{tool_call_catalog}\n\n"
             f"任务交接记录：\n{handoff_catalog}"
         )
 
@@ -753,6 +789,31 @@ class ContextRuntime:
         self.assignment_history.append(handoff)
         self.persist()
 
+    def record_tool_call(
+        self,
+        tool_name: str,
+        request: dict[str, JsonValue],
+        result_content: str,
+        result_truncated: bool,
+        agent_id: str,
+        status: Literal["succeeded", "timed_out"] = "succeeded",
+    ) -> ToolCallRecord:
+        """登记一次已完成调用，并保留后续可被事实引用的结果文本。"""
+        with self._state_lock:
+            tool_call_id = f"tool-call-{len(self.tool_call_records) + 1}"
+            record = ToolCallRecord(
+                tool_call_id=tool_call_id,
+                agent_id=agent_id,
+                tool_name=tool_name,
+                status=status,
+                request=request,
+                result_content=result_content,
+                result_truncated=result_truncated,
+            )
+            self.tool_call_records[tool_call_id] = record
+        self.persist()
+        return record
+
     def register_evidence(
         self,
         kind: Literal[
@@ -766,21 +827,22 @@ class ContextRuntime:
         detail: str,
         content: str,
         agent_id: str,
-    ) -> EvidenceRecord:
-        """登记一次实际工具结果，并将顺序 ID 绑定到调用 Agent。"""
-        with self._state_lock:
-            evidence_id = f"evidence-{len(self.evidence_records) + 1}"
-            evidence = EvidenceRecord(
-                evidence_id=evidence_id,
-                agent_id=agent_id,
-                kind=kind,
-                source=source,
-                detail=detail,
-                content=content,
-            )
-            self.evidence_records[evidence_id] = evidence
-        self.persist()
-        return evidence
+    ) -> ToolCallRecord:
+        """兼容旧工具注册接口；新工具应调用 ``record_tool_call``。
+
+        旧接口没有结构化请求与来源元数据，只能将原 ``detail`` 保留为迁移属性。
+        """
+        return self.record_tool_call(
+            tool_name=kind,
+            request={
+                "legacy_kind": kind,
+                "legacy_source": source,
+                "legacy_detail": detail,
+            },
+            result_content=content,
+            result_truncated="truncated" in content.casefold(),
+            agent_id=agent_id,
+        )
 
     def resolve_fact_claims(
         self, claims: list[FactClaim]
@@ -793,17 +855,17 @@ class ContextRuntime:
                 raise ValueError("事实陈述不能为空")
             citations: list[EvidenceCitation] = []
             for citation in claim.citations:
-                record = self.evidence_records.get(citation.evidence_id)
+                record = self.tool_call_records.get(citation.tool_call_id)
                 if record is None:
                     raise ValueError(
-                        f"未知证据 ID：{citation.evidence_id}"
+                        f"未知工具调用 ID：{citation.tool_call_id}"
                     )
                 normalized_quote = citation.quote.strip()
                 if not normalized_quote:
                     raise ValueError("证据原文不能为空")
-                if normalized_quote not in record.content:
+                if normalized_quote not in record.result_content:
                     raise ValueError(
-                        f"证据 {citation.evidence_id} 中不存在引用原文："
+                        f"工具调用 {citation.tool_call_id} 中不存在引用原文："
                         f"{normalized_quote!r}"
                     )
                 citations.append(

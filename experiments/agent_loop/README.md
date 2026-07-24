@@ -86,8 +86,9 @@ WorkspaceContextBuilder 不调用模型、不枚举工作区文件、不读取�
 事实。
 
 `TaskState` 保存当前任务的目标、计划、已完成步骤、重要事实、未决事项、完成
-条件、修改文件、验证结果和总体状态。工作区工具为实际结果登记顺序
-`evidence_id`，同时保存模型实际看到的有界结果文本。协调 Agent 通过
+条件、修改文件、验证结果和总体状态。工作区工具为每次实际完成的调用登记顺序
+`tool_call_id`，同时保存模型实际看到的有界结果文本和请求摘要。
+协调 Agent 通过
 `update_task_state` 提交重要事实时，必须同时提供 ID 和结果中的逐字 `quote`；
 Runtime 验证 quote 确实存在后，才将其合并为长期 `TaskFact`，后续状态更新不会
 覆盖已有事实。未决事项可在问题解决后显式替换。文件修改和验证结果仍只由实际
@@ -116,9 +117,10 @@ Runtime 验证 quote 确实存在后，才将其合并为长期 `TaskFact`，后
 工具通过 `AgentDependencies` 同时获得 `ContextRuntime` 和当前 `AgentContext`。
 工作区工具只读取共享路径；`select_skill` 只修改当前 Agent 的 Skill。所有路径都由宿主解析并验证，
 不能通过 `..` 或符号链接越过工作区。结果数量、读取字符数和搜索文件数均有
-上限。`.env` 不会被列出、读取或搜索。文本工具在首行返回 `evidence_id`，命令
-工具在结构化 `CommandResult` 中返回该字段；证据记录还保留实际返回文本，供
-`FactClaim` 的 quote 做精确子串校验。
+上限。`.env` 不会被列出、读取或搜索。文本工具在首行返回 `tool_call_id`，命令
+工具在结构化 `CommandResult` 中返回该字段。工具调用结果并非自动成为事实；仅当
+`FactClaim` 引用其实际返回文本中的 quote 并通过 Runtime 校验时，才可作为事实
+依据。
 
 精确替换和新文件创建成功后，Runtime 自动把相对路径加入
 `TaskState.modified_files`。`apply_workspace_edits` 会先在内存中依次验证所有编辑，

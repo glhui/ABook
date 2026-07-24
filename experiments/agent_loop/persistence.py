@@ -8,7 +8,7 @@ from threading import Lock
 import time
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 
 from .context import (
@@ -16,18 +16,18 @@ from .context import (
     AssignmentCompletionEvent,
     AssignmentSession,
     ContextRuntime,
-    EvidenceRecord,
+    ToolCallRecord,
     SkillRuntime,
     TaskFact,
     TaskHandoff,
     TaskState,
-    ValidationResult,
+    CommandCallRecord,
     WorkspaceContext,
 )
 
 
-SNAPSHOT_VERSION = 2
-SUPPORTED_SNAPSHOT_VERSIONS = frozenset({1, SNAPSHOT_VERSION})
+SNAPSHOT_VERSION = 3
+SUPPORTED_SNAPSHOT_VERSIONS = frozenset({1, 2, SNAPSHOT_VERSION})
 WINDOWS_REPLACE_ATTEMPTS = 5
 WINDOWS_REPLACE_RETRY_SECONDS = 0.02
 
@@ -44,7 +44,7 @@ class TaskStateSnapshot(BaseModel):
     unresolved_issues: list[str]
     completion_criteria: list[str]
     modified_files: list[str]
-    validation_results: list[ValidationResult]
+    validation_results: list[CommandCallRecord]
     status: Literal["in_progress", "complete", "blocked"]
 
 
@@ -100,11 +100,11 @@ class RuntimeSnapshot(BaseModel):
     task_state: TaskStateSnapshot
     agent_contexts: list[AgentContextSnapshot]
     assignments: list[AssignmentRecord]
-    evidence_records: list[EvidenceRecord]
+    tool_call_records: list[ToolCallRecord]
     assignment_history: list[TaskHandoff]
     pending_completion_events: list[AssignmentCompletionEvent]
     modified_files_by_agent: dict[str, list[str]]
-    validation_results_by_agent: dict[str, list[ValidationResult]]
+    validation_results_by_agent: dict[str, list[CommandCallRecord]]
     modification_revisions_by_agent: dict[str, int] = Field(
         default_factory=dict
     )
@@ -113,6 +113,17 @@ class RuntimeSnapshot(BaseModel):
     )
     next_call_id: int
     max_concurrent_assignments: int
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_evidence_records(cls, value: object) -> object:
+        """把 v1/v2 扁平证据列表迁移为 v3 工具调用结果列表。"""
+        if not isinstance(value, dict) or "tool_call_records" in value:
+            return value
+        migrated = dict(value)
+        legacy_records = migrated.pop("evidence_records", [])
+        migrated["tool_call_records"] = legacy_records
+        return migrated
 
 
 class RuntimeStateStore:
@@ -223,8 +234,9 @@ class RuntimeStateStore:
                 latest_handoff=record.latest_handoff,
                 error=error,
             )
-        runtime.evidence_records = {
-            record.evidence_id: record for record in snapshot.evidence_records
+        runtime.tool_call_records = {
+            record.tool_call_id: record
+            for record in snapshot.tool_call_records
         }
         runtime.assignment_history = list(snapshot.assignment_history)
         runtime.pending_completion_events = list(
@@ -294,7 +306,7 @@ class RuntimeStateStore:
             task_state=TaskStateSnapshot(**vars(runtime.task_state)),
             agent_contexts=contexts,
             assignments=assignments,
-            evidence_records=list(runtime.evidence_records.values()),
+            tool_call_records=list(runtime.tool_call_records.values()),
             assignment_history=runtime.assignment_history,
             pending_completion_events=runtime.pending_completion_events,
             modified_files_by_agent=runtime.modified_files_by_agent,

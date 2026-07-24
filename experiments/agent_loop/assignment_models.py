@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from .context import FactClaim, SKILL_ID_PATTERN
 
@@ -26,7 +26,11 @@ class TaskReport(BaseModel):
     status: Literal["completed", "needs_follow_up", "blocked"]
     summary: str = Field(min_length=1, max_length=4_000)
     facts: list[FactClaim] = Field(default_factory=list, max_length=20)
-    evidence_ids: list[str] = Field(default_factory=list, max_length=20)
+    tool_call_ids: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        validation_alias=AliasChoices("tool_call_ids", "evidence_ids"),
+    )
     unresolved_issues: list[str] = Field(default_factory=list, max_length=20)
     recommended_next_actions: list[str] = Field(
         default_factory=list, max_length=20

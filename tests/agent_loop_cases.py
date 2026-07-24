@@ -2,6 +2,7 @@
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import json
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -248,6 +249,68 @@ class WorkspaceContextBuilderTests(unittest.TestCase):
             list((self.workspace_root / ".abook").glob("*.tmp")),
         )
 
+    def test_runtime_snapshot_migrates_legacy_evidence_records(self) -> None:
+        """v2 快照中的扁平证据记录恢复为 v3 ToolCallRecord。"""
+        workspace_context = WorkspaceContextBuilder(
+            self.workspace_root, self.skills_root
+        ).build()
+        runtime = ContextRuntime(workspace_context, TaskState(goal="快照迁移"))
+        runtime.create_agent_context(
+            "coordinator", "快照迁移", "general", role="coordinator"
+        )
+        state_store = RuntimeStateStore(self.workspace_root / "state.json")
+        state_store.save(runtime)
+        snapshot = json.loads(state_store.path.read_text(encoding="utf-8"))
+        snapshot["version"] = 2
+        snapshot["evidence_records"] = [
+            {
+                "evidence_id": "evidence-7",
+                "agent_id": "coordinator",
+                "kind": "file_read",
+                "source": "src/config.py",
+                "detail": "lines 1-2",
+                "content": "ABOOK_MODEL=test",
+            }
+        ]
+        snapshot.pop("tool_call_records")
+        state_store.path.write_text(
+            json.dumps(snapshot), encoding="utf-8"
+        )
+
+        restored = state_store.load(workspace_context)
+
+        self.assertIsNotNone(restored)
+        assert restored is not None
+        record = restored.tool_call_records["evidence-7"]
+        self.assertEqual("file_read", record.tool_name)
+        self.assertEqual("src/config.py", record.request["legacy_source"])
+        self.assertEqual("lines 1-2", record.request["legacy_detail"])
+        self.assertEqual("ABOOK_MODEL=test", record.result_content)
+
+    def test_tool_call_record_preserves_structured_request(self) -> None:
+        """通用调用记录保留宿主接受的结构化请求。"""
+        workspace_context = WorkspaceContextBuilder(
+            self.workspace_root, self.skills_root
+        ).build()
+        runtime = ContextRuntime(workspace_context, TaskState(goal="来源记录"))
+        coordinator = runtime.create_agent_context(
+            "coordinator", "来源记录", "general", role="coordinator"
+        )
+
+        record = runtime.record_tool_call(
+            tool_name="fetch_web_page",
+            request={"url": "https://docs.example.test/start"},
+            result_content="文档正文",
+            result_truncated=False,
+            agent_id=coordinator.agent_id,
+        )
+
+        self.assertEqual("fetch_web_page", record.tool_name)
+        self.assertEqual(
+            "https://docs.example.test/start", record.request["url"]
+        )
+        self.assertEqual("文档正文", record.result_content)
+
     def test_runtime_rejects_blank_task_and_external_directory(self) -> None:
         """Agent 任务和共享工作目录分别在所属边界完成校验。"""
         builder = WorkspaceContextBuilder(
@@ -319,10 +382,10 @@ class WorkspaceContextBuilderTests(unittest.TestCase):
             coordinator_context, "汇总"
         )
 
-        self.assertIn("first.txt", first_prompt)
-        self.assertNotIn("second.txt", first_prompt)
-        self.assertIn("first.txt", coordinator_prompt)
-        self.assertIn("second.txt", coordinator_prompt)
+        self.assertIn("tool-call-1", first_prompt)
+        self.assertNotIn("tool-call-2", first_prompt)
+        self.assertIn("tool-call-1", coordinator_prompt)
+        self.assertIn("tool-call-2", coordinator_prompt)
 
     def test_runtime_event_channels_support_multiple_subscribers(self) -> None:
         """日志和宿主可同时订阅事件，取消一方不会覆盖另一方。"""
@@ -630,7 +693,7 @@ class AgentRuntimeTests(unittest.TestCase):
                             args={
                                 "status": "completed",
                                 "summary": "后台检查完成",
-                                "evidence_ids": [],
+                                "tool_call_ids": [],
                                 "unresolved_issues": [],
                                 "recommended_next_actions": [],
                             },
@@ -854,7 +917,7 @@ class AgentRuntimeTests(unittest.TestCase):
                                         "statement": "已确认上下文规则",
                                         "citations": [
                                             {
-                                                "evidence_id": "evidence-1",
+                                                "tool_call_id": "tool-call-1",
                                                 "quote": "上下文规则",
                                             }
                                         ],
@@ -986,7 +1049,7 @@ class AgentRuntimeTests(unittest.TestCase):
                         statement="TaskState 属于 Runtime",
                         citations=[
                             EvidenceQuoteClaim(
-                                evidence_id=evidence.evidence_id,
+                                tool_call_id=evidence.tool_call_id,
                                 quote="class TaskState",
                             )
                         ],
@@ -1001,7 +1064,7 @@ class AgentRuntimeTests(unittest.TestCase):
                         statement="TaskState 属于 Runtime",
                         citations=[
                             EvidenceQuoteClaim(
-                                evidence_id=evidence.evidence_id,
+                                tool_call_id=evidence.tool_call_id,
                                 quote="class TaskState",
                             )
                         ],
@@ -1019,8 +1082,8 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(1, len(runtime.task_state.important_facts))
         self.assertEqual([], runtime.task_state.unresolved_issues)
         self.assertIn("TaskState 属于 Runtime", rendered_state)
-        self.assertIn("evidence-1", rendered_state)
-        self.assertIn("context.py (lines 1-20)", rendered_state)
+        self.assertIn("tool-call-1", rendered_state)
+        self.assertIn("tool-call-1 (file_read)", rendered_state)
 
     def test_update_task_state_rejects_unknown_evidence(self) -> None:
         """模型不能把不存在的工具结果登记为已证实事实。"""
@@ -1033,7 +1096,7 @@ class AgentRuntimeTests(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(
-                RecoverableToolError, "未知证据 ID"
+                RecoverableToolError, "未知工具调用 ID"
             ):
                 update_task_state(
                     tool_context,
@@ -1042,7 +1105,7 @@ class AgentRuntimeTests(unittest.TestCase):
                             statement="未经工具证实的事实",
                             citations=[
                                 EvidenceQuoteClaim(
-                                    evidence_id="evidence-99",
+                                    tool_call_id="tool-call-99",
                                     quote="不存在",
                                 )
                             ],
@@ -1076,7 +1139,7 @@ class AgentRuntimeTests(unittest.TestCase):
                             statement="认证使用 OAuth",
                             citations=[
                                 EvidenceQuoteClaim(
-                                    evidence_id=evidence.evidence_id,
+                                    tool_call_id=evidence.tool_call_id,
                                     quote="OAuth",
                                 )
                             ],
@@ -1290,11 +1353,18 @@ class WorkspaceToolTests(unittest.TestCase):
         self.assertIn("truncated after 10 characters", content)
         self.assertIn("src/app.py:2:Needle value", matches)
         self.assertNotIn("ignored.txt", matches)
-        self.assertIn("[evidence_id=evidence-1]", listing)
-        self.assertIn("[evidence_id=evidence-2]", content)
-        self.assertIn("[evidence_id=evidence-3]", matches)
-        evidence = self.tool_context.deps.runtime.evidence_records
-        self.assertEqual("src/app.py", evidence["evidence-2"].source)
+        self.assertIn("[tool_call_id=tool-call-1]", listing)
+        self.assertIn("[tool_call_id=tool-call-2]", content)
+        self.assertIn("[tool_call_id=tool-call-3]", matches)
+        records = self.tool_context.deps.runtime.tool_call_records
+        record = records["tool-call-2"]
+        self.assertEqual("read_workspace_file", record.tool_name)
+        self.assertEqual(
+            {"path": "src/app.py", "start_line": 1, "end_line": None,
+             "max_characters": 10},
+            record.request,
+        )
+        self.assertTrue(record.result_truncated)
 
     def test_tools_report_recoverable_path_errors(self) -> None:
         """路径错误使用统一异常，交给 RetryToolset 转换。"""
@@ -1315,10 +1385,11 @@ class WorkspaceToolTests(unittest.TestCase):
 
         self.assertIn("Needle value", content)
         self.assertNotIn("first line", content)
-        evidence = self.tool_context.deps.runtime.evidence_records[
-            "evidence-1"
+        record = self.tool_context.deps.runtime.tool_call_records[
+            "tool-call-1"
         ]
-        self.assertIn("lines 2-2 of 3", evidence.detail)
+        self.assertEqual(2, record.request["start_line"])
+        self.assertEqual(2, record.request["end_line"])
 
     def test_replace_workspace_text_requires_exact_occurrence_count(
         self,
@@ -1439,7 +1510,7 @@ class WorkspaceToolTests(unittest.TestCase):
         self.assertEqual(0, result.exit_code)
         self.assertFalse(result.timed_out)
         self.assertIn("src", result.stdout.casefold())
-        self.assertEqual("evidence-1", result.evidence_id)
+        self.assertEqual("tool-call-1", result.tool_call_id)
 
     def test_validation_command_updates_task_state(self) -> None:
         """实际执行的编译命令由宿主记录到 TaskState。"""
@@ -1555,7 +1626,7 @@ class TaskCoordinationTests(unittest.TestCase):
             custom_output_args={
                 "status": "completed",
                 "summary": "工作包完成",
-                "evidence_ids": [],
+                "tool_call_ids": [],
                 "unresolved_issues": [],
                 "recommended_next_actions": [],
             },
@@ -1709,7 +1780,7 @@ class TaskCoordinationTests(unittest.TestCase):
                         args={
                             "status": "completed",
                             "summary": "并行完成",
-                            "evidence_ids": [],
+                            "tool_call_ids": [],
                             "unresolved_issues": [],
                             "recommended_next_actions": [],
                         },
@@ -1782,7 +1853,7 @@ class TaskCoordinationTests(unittest.TestCase):
                                 else "completed"
                             ),
                             "summary": response,
-                            "evidence_ids": [],
+                            "tool_call_ids": [],
                             "unresolved_issues": (
                                 ["测试失败"] if first_turn else []
                             ),
@@ -1899,13 +1970,13 @@ class TaskCoordinationTests(unittest.TestCase):
                                     "statement": "note.txt 包含关键结论",
                                     "citations": [
                                         {
-                                            "evidence_id": "evidence-1",
+                                            "tool_call_id": "tool-call-1",
                                             "quote": "关键结论",
                                         }
                                     ],
                                 }
                             ],
-                            "evidence_ids": ["evidence-1"],
+                            "tool_call_ids": ["tool-call-1"],
                             "unresolved_issues": [],
                             "recommended_next_actions": [],
                         },
@@ -1939,7 +2010,7 @@ class TaskCoordinationTests(unittest.TestCase):
 
         self.assertEqual("已确认关键结论", result.summary)
         self.assertEqual(1, len(result.evidence))
-        self.assertEqual("note.txt", result.evidence[0].source)
+        self.assertEqual("note.txt", result.evidence[0].request["path"])
         self.assertEqual(1, len(result.facts))
         self.assertEqual(
             "note.txt 包含关键结论", result.facts[0].statement

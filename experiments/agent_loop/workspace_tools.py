@@ -9,12 +9,12 @@ import sys
 import tempfile
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.toolsets import FunctionToolset, WrapperToolset
 from pydantic_ai.toolsets.abstract import ToolsetTool
 
-from .context import AgentDependencies
+from .context import AgentDependencies, ToolCallRecord
 
 
 IGNORED_WORKSPACE_DIRECTORIES = frozenset(
@@ -76,12 +76,17 @@ class CommandResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    evidence_id: str
+    tool_call_id: str
     command: str
     exit_code: int | None
     stdout: str
     stderr: str
     timed_out: bool
+
+    @property
+    def evidence_id(self) -> str:
+        """兼容旧调用方；新代码应读取 ``tool_call_id``。"""
+        return self.tool_call_id
 
 
 class WorkspaceTextEdit(BaseModel):
@@ -128,9 +133,28 @@ class RetryToolset(WrapperToolset[AgentDependencies]):
             raise ModelRetry(str(error)) from error
 
 
-def _with_evidence(evidence_id: str, result: str) -> str:
-    """在文本工具结果首行暴露可供 TaskState 引用的证据 ID。"""
-    return f"[evidence_id={evidence_id}]\n{result}"
+def _with_tool_call(tool_call_id: str, result: str) -> str:
+    """在文本工具结果首行暴露后续事实可引用的工具调用 ID。"""
+    return f"[tool_call_id={tool_call_id}]\n{result}"
+
+
+def _record_tool_call(
+    ctx: RunContext[AgentDependencies],
+    tool_name: str,
+    request: dict[str, JsonValue],
+    result_content: str,
+    result_truncated: bool,
+    status: Literal["succeeded", "timed_out"] = "succeeded",
+) -> ToolCallRecord:
+    """把宿主已完成的工具调用登记为可引用的统一结果记录。"""
+    return ctx.deps.runtime.record_tool_call(
+        tool_name=tool_name,
+        request=request,
+        result_content=result_content,
+        result_truncated=result_truncated,
+        agent_id=ctx.deps.agent_context.agent_id,
+        status=status,
+    )
 
 
 def _resolve_workspace_path(
@@ -239,19 +263,16 @@ def list_workspace_files(
         )
 
     files = _iter_workspace_files(resolved_directory)
-    relative_directory = resolved_directory.relative_to(
-        ctx.deps.workspace_root
-    ).as_posix() or "."
     if not files:
         result = "No files found."
-        evidence = ctx.deps.runtime.register_evidence(
-            "file_listing",
-            relative_directory,
-            "0 files returned",
+        record = _record_tool_call(
+            ctx,
+            "list_workspace_files",
+            {"directory": directory, "limit": limit},
             result,
-            ctx.deps.agent_context.agent_id,
+            False,
         )
-        return _with_evidence(evidence.evidence_id, result)
+        return _with_tool_call(record.tool_call_id, result)
 
     displayed_files = files[:limit]
     lines = [
@@ -261,14 +282,14 @@ def list_workspace_files(
     if len(files) > limit:
         lines.append(f"... truncated; {len(files)} files found.")
     result = "\n".join(lines)
-    evidence = ctx.deps.runtime.register_evidence(
-        "file_listing",
-        relative_directory,
-        f"returned {len(displayed_files)} of {len(files)} files",
+    record = _record_tool_call(
+        ctx,
+        "list_workspace_files",
+        {"directory": directory, "limit": limit},
         result,
-        ctx.deps.agent_context.agent_id,
+        len(files) > limit,
     )
-    return _with_evidence(evidence.evidence_id, result)
+    return _with_tool_call(record.tool_call_id, result)
 
 
 def read_workspace_file(
@@ -347,10 +368,6 @@ def read_workspace_file(
     selected_content = "".join(
         content_lines[start_line - 1:selected_end]
     )
-    relative_path = resolved_path.relative_to(
-        ctx.deps.workspace_root
-    ).as_posix()
-    returned_characters = min(len(selected_content), max_characters)
     if len(selected_content) <= max_characters:
         result = selected_content
     else:
@@ -358,15 +375,19 @@ def read_workspace_file(
             selected_content[:max_characters]
             + f"\n... truncated after {max_characters} characters."
         )
-    evidence = ctx.deps.runtime.register_evidence(
-        "file_read",
-        relative_path,
-        f"lines {start_line}-{selected_end} of {line_count}; "
-        f"returned {returned_characters} characters",
+    record = _record_tool_call(
+        ctx,
+        "read_workspace_file",
+        {
+            "path": requested_path,
+            "start_line": start_line,
+            "end_line": end_line,
+            "max_characters": max_characters,
+        },
         result,
-        ctx.deps.agent_context.agent_id,
+        len(selected_content) > max_characters,
     )
-    return _with_evidence(evidence.evidence_id, result)
+    return _with_tool_call(record.tool_call_id, result)
 
 
 def search_workspace_text(
@@ -426,20 +447,14 @@ def search_workspace_text(
                 result = "\n".join(
                     matches + ["... match results truncated."]
                 )
-                evidence = ctx.deps.runtime.register_evidence(
-                    "text_search",
-                    directory,
-                    f"query={query!r}; locations="
-                    + ", ".join(
-                        match.rsplit(":", 1)[0] for match in matches
-                    ),
+                record = _record_tool_call(
+                    ctx,
+                    "search_workspace_text",
+                    {"query": query, "directory": directory, "limit": limit},
                     result,
-                    ctx.deps.agent_context.agent_id,
+                    True,
                 )
-                return _with_evidence(
-                    evidence.evidence_id,
-                    result,
-                )
+                return _with_tool_call(record.tool_call_id, result)
 
     if not matches:
         matches.append("No matching text found.")
@@ -452,14 +467,14 @@ def search_workspace_text(
             f"Skipped {skipped_non_utf8_files} non-UTF-8 files."
         )
     result = "\n".join(matches)
-    evidence = ctx.deps.runtime.register_evidence(
-        "text_search",
-        directory,
-        f"query={query!r}; returned {len(matches)} result line(s)",
+    record = _record_tool_call(
+        ctx,
+        "search_workspace_text",
+        {"query": query, "directory": directory, "limit": limit},
         result,
-        ctx.deps.agent_context.agent_id,
+        search_truncated,
     )
-    return _with_evidence(evidence.evidence_id, result)
+    return _with_tool_call(record.tool_call_id, result)
 
 
 def replace_workspace_text(
@@ -512,9 +527,9 @@ def replace_workspace_text(
             )
         ],
     )
-    evidence_header = result.splitlines()[0]
+    tool_call_header = result.splitlines()[0]
     return (
-        f"{evidence_header}\nReplaced {expected_replacements} "
+        f"{tool_call_header}\nReplaced {expected_replacements} "
         f"occurrence(s) in {Path(path).as_posix()}."
     )
 
@@ -601,15 +616,22 @@ def apply_workspace_edits(
     ctx.deps.runtime.record_modified_file(
         relative_path, ctx.deps.agent_context.agent_id
     )
-    evidence = ctx.deps.runtime.register_evidence(
-        "file_change",
-        relative_path,
-        f"applied {len(edits)} edit(s); replaced {total_replacements} occurrence(s)",
-        "\n\n".join(edit_summaries),
-        ctx.deps.agent_context.agent_id,
+    result_content = "\n\n".join(edit_summaries)
+    record = _record_tool_call(
+        ctx,
+        "apply_workspace_edits",
+        {
+            "path": path,
+            "edit_count": len(edits),
+            "expected_replacements": [
+                edit.expected_replacements for edit in edits
+            ],
+        },
+        result_content,
+        False,
     )
-    return _with_evidence(
-        evidence.evidence_id,
+    return _with_tool_call(
+        record.tool_call_id,
         f"Applied {len(edits)} edit(s) with {total_replacements} "
         f"replacement(s) in {relative_path}.",
     )
@@ -670,15 +692,19 @@ def write_workspace_file(
     ctx.deps.runtime.record_modified_file(
         relative_path, ctx.deps.agent_context.agent_id
     )
-    evidence = ctx.deps.runtime.register_evidence(
-        "file_change",
-        relative_path,
-        f"created UTF-8 file with {len(content)} characters",
+    record = _record_tool_call(
+        ctx,
+        "write_workspace_file",
+        {
+            "path": path,
+            "content_characters": len(content),
+            "create_parent_directories": create_parent_directories,
+        },
         content,
-        ctx.deps.agent_context.agent_id,
+        False,
     )
-    return _with_evidence(
-        evidence.evidence_id,
+    return _with_tool_call(
+        record.tool_call_id,
         f"Created {relative_path} with {len(content)} characters.",
     )
 
@@ -868,15 +894,20 @@ def run_powershell_command(
             f"timed_out=True\nexit_code=None\n"
             f"stdout:\n{stdout}\nstderr:\n{stderr}"
         )
-        evidence = ctx.deps.runtime.register_evidence(
-            "command",
-            command,
-            "timed out; exit_code=None",
+        record = _record_tool_call(
+            ctx,
+            "run_powershell_command",
+            {
+                "command": command,
+                "working_directory": working_directory,
+                "timeout_seconds": timeout_seconds,
+            },
             evidence_content,
-            ctx.deps.agent_context.agent_id,
+            "truncated" in evidence_content.casefold(),
+            status="timed_out",
         )
         return CommandResult(
-            evidence_id=evidence.evidence_id,
+            tool_call_id=record.tool_call_id,
             command=command,
             exit_code=None,
             stdout=stdout,
@@ -891,26 +922,26 @@ def run_powershell_command(
             timed_out=False,
             agent_id=ctx.deps.agent_context.agent_id,
         )
-    relative_working_directory = command_working_directory.relative_to(
-        ctx.deps.workspace_root
-    ).as_posix() or "."
     stdout = _truncate_command_output(completed_process.stdout)
     stderr = _truncate_command_output(completed_process.stderr)
     evidence_content = (
         f"exit_code={completed_process.returncode}\n"
-        f"working_directory={relative_working_directory}\n"
+        f"working_directory={working_directory}\n"
         f"stdout:\n{stdout}\nstderr:\n{stderr}"
     )
-    evidence = ctx.deps.runtime.register_evidence(
-        "command",
-        command,
-        f"exit_code={completed_process.returncode}; "
-        f"working_directory={relative_working_directory}",
+    record = _record_tool_call(
+        ctx,
+        "run_powershell_command",
+        {
+            "command": command,
+            "working_directory": working_directory,
+            "timeout_seconds": timeout_seconds,
+        },
         evidence_content,
-        ctx.deps.agent_context.agent_id,
+        "truncated" in evidence_content.casefold(),
     )
     return CommandResult(
-        evidence_id=evidence.evidence_id,
+        tool_call_id=record.tool_call_id,
         command=command,
         exit_code=completed_process.returncode,
         stdout=stdout,
@@ -1023,15 +1054,22 @@ def run_python_validation(
             timed_out=True,
             agent_id=ctx.deps.agent_context.agent_id,
         )
-        evidence = ctx.deps.runtime.register_evidence(
-            "command",
-            command,
-            "timed out; exit_code=None",
-            f"timed_out=True\nstdout:\n{stdout}\nstderr:\n{stderr}",
-            ctx.deps.agent_context.agent_id,
+        evidence_content = f"timed_out=True\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        record = _record_tool_call(
+            ctx,
+            "run_python_validation",
+            {
+                "validation": validation,
+                "target": target,
+                "pattern": pattern,
+                "timeout_seconds": timeout_seconds,
+            },
+            evidence_content,
+            "truncated" in evidence_content.casefold(),
+            status="timed_out",
         )
         return CommandResult(
-            evidence_id=evidence.evidence_id,
+            tool_call_id=record.tool_call_id,
             command=command,
             exit_code=None,
             stdout=stdout,
@@ -1047,16 +1085,24 @@ def run_python_validation(
         timed_out=False,
         agent_id=ctx.deps.agent_context.agent_id,
     )
-    evidence = ctx.deps.runtime.register_evidence(
-        "command",
-        command,
-        f"exit_code={completed_process.returncode}",
+    evidence_content = (
         f"exit_code={completed_process.returncode}\n"
-        f"stdout:\n{stdout}\nstderr:\n{stderr}",
-        ctx.deps.agent_context.agent_id,
+        f"stdout:\n{stdout}\nstderr:\n{stderr}"
+    )
+    record = _record_tool_call(
+        ctx,
+        "run_python_validation",
+        {
+            "validation": validation,
+            "target": target,
+            "pattern": pattern,
+            "timeout_seconds": timeout_seconds,
+        },
+        evidence_content,
+        "truncated" in evidence_content.casefold(),
     )
     return CommandResult(
-        evidence_id=evidence.evidence_id,
+        tool_call_id=record.tool_call_id,
         command=command,
         exit_code=completed_process.returncode,
         stdout=stdout,

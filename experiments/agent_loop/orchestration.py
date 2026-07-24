@@ -51,7 +51,7 @@ def update_task_state(
         Field(
             max_length=20,
             description=(
-                "合并重要事实；每项必须引用 evidence_id 并逐字摘录支持原文"
+                "合并重要事实；每项必须引用 tool_call_id 并逐字摘录支持原文"
             ),
         ),
     ] = None,
@@ -551,8 +551,8 @@ def _build_handoff(
         summary=report.summary,
         facts=tuple(runtime.resolve_fact_claims(report.facts)),
         evidence=tuple(
-            runtime.evidence_records[evidence_id]
-            for evidence_id in report.evidence_ids
+            runtime.tool_call_records[tool_call_id]
+            for tool_call_id in report.tool_call_ids
         ),
         modified_files=tuple(dict.fromkeys(modified_files)),
         validation_results=tuple(validation_results),

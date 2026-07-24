@@ -1,5 +1,9 @@
 # Pydantic `BaseModel` 与 `model_config` 使用指南
 
+> 注意：本文的 `EvidenceRecord` 示例说明早期的扁平证据模型。当前 Runtime 使用
+> `ToolCallRecord` 保存结构化工具调用结果，并以 `tool_call_id` 供 `FactClaim`
+> 引用；请以 `context.py` 中的当前模型为准。
+
 本文介绍 ABook 中使用的 Pydantic 2 模型写法，重点说明 `BaseModel`、
 `ConfigDict`、字段类型、验证和序列化之间的关系。文中的示例使用 Pydantic
 2.x 语法，与项目当前依赖一致。

@@ -23,19 +23,19 @@ OutputT = TypeVar("OutputT")
 
 
 
-# 事实性压缩而非简单摘要，保留可验证的 evidence_id 与 quote，避免模型伪造历史
+# 事实性压缩而非简单摘要，保留可验证的 tool_call_id 与 quote，避免模型伪造历史
 class CompactionCheckpoint(BaseModel):
     """在替换旧消息前交由 Runtime 校验和保存的结构化交接单。
 
     当某个 Agent 的历史达到上下文阈值时，Runtime 不会直接删除较早消息，而是先让
     模型从这些消息生成本对象。Runtime 随后校验 ``facts`` 中每个 quote 是否真实
-    出现在对应 ``evidence_id`` 的工具结果中；校验通过后，事实和未决事项会写入
+    出现在对应 ``tool_call_id`` 的工具结果中；校验通过后，事实和未决事项会写入
     ``TaskState``，最后才以 ``summary`` 替换旧历史。校验失败会要求模型重试，旧
     历史保持不变。
 
-    例如，Agent 曾读取 ``config.py`` 并获得 ``evidence-8``，工具结果包含
+    例如，Agent 曾读取 ``config.py`` 并获得 ``tool-call-8``，工具结果包含
     ``ABOOK_MODEL``。压缩时可记录“模型名称来自 ABOOK_MODEL”这一事实，并引用
-    ``evidence-8`` 和原文 ``ABOOK_MODEL``；如果尚未确认默认模型是否可用，则把
+    ``tool-call-8`` 和原文 ``ABOOK_MODEL``；如果尚未确认默认模型是否可用，则把
     该问题放入 ``unresolved_issues``。文件全文和重复对话只进入 ``summary`` 或被
     丢弃，不应伪造为已验证事实。
     """
@@ -50,7 +50,7 @@ class CompactionCheckpoint(BaseModel):
     facts: list[FactClaim] = Field(
         default_factory=list,
         max_length=50,
-        description="必须带 evidence_id 与逐字 quote 的可验证事实",
+        description="必须带 tool_call_id 与逐字 quote 的可验证事实",
     )
     unresolved_issues: list[str] = Field(
         default_factory=list,
@@ -123,7 +123,7 @@ class AgentTurnResult(Generic[OutputT]):
 COMPACTION_INSTRUCTIONS = (
     "你负责压缩编码 Agent 的旧消息历史。保留用户目标、仍然有效的约束、"
     "关键决定及原因、已完成工作、工具证实的事实、修改文件、验证结果和未决问题。"
-    "每条 facts 必须引用历史中真实出现的 evidence_id，并逐字摘录该工具结果中的"
+    "每条 facts 必须引用历史中真实出现的 tool_call_id，并逐字摘录该工具结果中的"
     "支持原文 quote。删除重复对话和可重新获取的普通工具输出，不得补充历史中没有"
     "的事实。summary 使用简洁中文，unresolved_issues 保存仍需处理的问题。"
 )
