@@ -7,15 +7,16 @@ from typing import Generic, TypeVar
 
 EventT = TypeVar("EventT")
 Unsubscribe = Callable[[], None]
+# 取消一次事件订阅的可调用句柄；调用方应在生命周期结束时执行它。
 
 
 @dataclass
 class SyncEventChannel(Generic[EventT]):
     """按注册顺序同步广播事件，并允许多个宿主独立订阅。
 
-    订阅返回的取消函数只移除本次注册，因而 CLI、测试和监控代码不需要通过
-    保存并覆盖 Runtime 单一回调来共享事件。处理器异常会继续向发布者传播，
-    由最了解调用边界的上层决定是否降级或记录错误。
+    ``subscribe`` 返回一个取消订阅句柄；调用该句柄只移除本次注册，因而
+    CLI、测试和监控代码不需要通过保存并覆盖 Runtime 单一回调来共享事件。
+    处理器异常会继续向发布者传播，由最了解调用边界的上层决定是否降级或记录错误。
     """
 
     _handlers: list[Callable[[EventT], None]] = field(
@@ -23,7 +24,11 @@ class SyncEventChannel(Generic[EventT]):
     )
 
     def subscribe(self, handler: Callable[[EventT], None]) -> Unsubscribe:
-        """注册同步处理器并返回幂等的取消订阅函数。"""
+        """注册同步处理器并返回幂等的取消订阅句柄。
+
+        返回值不是事件处理器，也不会自动执行；调用它才能移除本次订阅。
+        会话或其他订阅方结束时应调用该句柄，避免后续事件继续触发处理器。
+        """
         self._handlers.append(handler)
 
         def unsubscribe() -> None:
@@ -60,7 +65,11 @@ class AsyncEventChannel(Generic[EventT]):
     def subscribe(
         self, handler: Callable[[EventT], Awaitable[None]]
     ) -> Unsubscribe:
-        """注册异步处理器并返回幂等的取消订阅函数。"""
+        """注册异步处理器并返回幂等的取消订阅句柄。
+
+        返回值不是事件处理器，也不会自动执行；调用它才能移除本次订阅。
+        会话或其他订阅方结束时应调用该句柄，避免后续事件继续触发处理器。
+        """
         self._handlers.append(handler)
 
         def unsubscribe() -> None:

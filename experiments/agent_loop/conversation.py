@@ -172,19 +172,33 @@ class ConversationSession:
         return None
 
     async def run(self, initial_request: str) -> None:
-        """启动订阅和调度器恢复，然后持续处理用户请求直到退出。"""
+        """启动事件订阅和调度器恢复，然后持续处理用户请求直到退出。
+
+        ``subscribe`` 返回的 ``unsubscribe_*`` 变量是取消订阅句柄，不是
+        后台任务。会话结束时，``finally`` 会调用它们移除本会话的事件处理器，
+        同时取消 ``completion_processor`` 后台任务，防止已结束的会话继续处理事件。
+        """
+
+        # 把 Agent 的调用状态格式化后输出到终端，例如显示“正在调用哪个工具”“调用成功或失败”
         unsubscribe_calls = self.runtime.call_events.subscribe(
             self.emit_call_status
         )
+
+        # 当某个任务完成并发布完成事件时，放入会话私有队列，供后台协程处理
         unsubscribe_assignments = self.runtime.assignment_events.subscribe(
             self.continue_after_assignment
         )
+
+        # 后台协程持续监听完成事件队列，并在有新事件时触发协调 Agent 续跑
         completion_processor = asyncio.create_task(
             self.process_completion_events()
         )
+
+        # 启动会话并恢复上次状态，包括未处理的任务完成事件和调度器的挂起任务
         initialize_assignment_scheduler(self.runtime, self.agent.model)
         for pending_event in list(self.runtime.pending_completion_events):
             await self.continue_after_assignment(pending_event)
+        
         request = initial_request.strip()
         try:
             while True:
