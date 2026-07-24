@@ -138,7 +138,7 @@ class AgentRunner:
     async def run_turn(
         self,
         agent: Agent[AgentDependencies, OutputT],
-        runtime: ContextRuntime,
+        runtime: ContextRuntime, # 全局
         agent_context: AgentContext,
         request: str,
     ) -> AgentTurnResult[OutputT]:
@@ -266,9 +266,13 @@ class AgentRunner:
         ):
             return None
 
+        # compaction_agent: 需要压缩总结的旧历史
+        # retained_messages: 需要保留的最近一轮原始消息
         compacted_messages, retained_messages = _split_history(
             agent_context.message_history
         )
+
+        # 如果 retained_messages 也超过阈值，则直接压缩整个历史，避免无限循环
         if runtime.context_window.should_compact(retained_messages):
             compacted_messages = agent_context.message_history
             retained_messages = []
@@ -354,7 +358,7 @@ def _split_history(
 
 def _create_compaction_agent(
     model: Model,
-) -> Agent[AgentDependencies, CompactionCheckpoint]:
+) -> Agent[AgentDependencies, CompactionCheckpoint]: # 接受一个模型，返回一个输出类型为 CompactionCheckpoint 的 Agent
     """创建带事实引用校验的无工具压缩 Agent。"""
     checkpoint_agent = Agent(
         model,
@@ -378,10 +382,11 @@ def _create_compaction_agent(
     return checkpoint_agent
 
 
+# 把压缩Agent生成的CompactionCheckpoint应用到当前的运行状态。
 def _apply_checkpoint(
     runtime: ContextRuntime,
     agent_context: AgentContext,
-    checkpoint: CompactionCheckpoint,
+    checkpoint: CompactionCheckpoint, # 压缩Agent生成的检查点
     retained_messages: list[ModelMessage],
 ) -> None:
     """先沉淀结构化事实与未决事项，再替换原始历史。"""
