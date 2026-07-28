@@ -2,9 +2,9 @@
 
 from typing import Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-from .context import FactClaim, SKILL_ID_PATTERN
+from ..context import Fact, SKILL_ID_PATTERN
 
 
 class AgentTemplate(BaseModel):
@@ -19,18 +19,13 @@ class AgentTemplate(BaseModel):
 
 
 class TaskReport(BaseModel):
-    """任务 Agent 必须返回的语义报告；副作用字段由 Runtime 补充。"""
+    """任务 Agent 的工作结果与任务分配作用域事实；副作用由 Runtime 补充。"""
 
     model_config = ConfigDict(extra="forbid")
 
     status: Literal["completed", "needs_follow_up", "blocked"]
     summary: str = Field(min_length=1, max_length=4_000)
-    facts: list[FactClaim] = Field(default_factory=list, max_length=20)
-    tool_call_ids: list[str] = Field(
-        default_factory=list,
-        max_length=20,
-        validation_alias=AliasChoices("tool_call_ids", "evidence_ids"),
-    )
+    task_facts: list[Fact] = Field(default_factory=list, max_length=20)
     unresolved_issues: list[str] = Field(default_factory=list, max_length=20)
     recommended_next_actions: list[str] = Field(
         default_factory=list, max_length=20

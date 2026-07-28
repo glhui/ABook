@@ -10,12 +10,12 @@ from typing import Generic, TypeVar
 
 from pydantic_ai import Agent
 
-from experiments.agent_loop.context import (
+from experiments.agent_loop.core.context import (
     AgentContext,
     AgentDependencies,
     ContextRuntime,
 )
-from experiments.agent_loop.runner import AgentTurnResult
+from experiments.agent_loop.core.runner import AgentTurnResult
 
 
 OutputT = TypeVar("OutputT")

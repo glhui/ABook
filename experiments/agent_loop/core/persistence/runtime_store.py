@@ -8,26 +8,24 @@ from threading import Lock
 import time
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 
-from .context import (
+from ..context import (
     AgentContext,
-    AssignmentCompletionEvent,
+    AgentCompletionEvent,
     AssignmentSession,
     ContextRuntime,
     ToolCallRecord,
     SkillRuntime,
-    TaskFact,
+    Fact,
     TaskHandoff,
     TaskState,
-    CommandCallRecord,
     WorkspaceContext,
 )
 
 
-SNAPSHOT_VERSION = 3
-SUPPORTED_SNAPSHOT_VERSIONS = frozenset({1, 2, SNAPSHOT_VERSION})
+SNAPSHOT_VERSION = 5
 WINDOWS_REPLACE_ATTEMPTS = 5
 WINDOWS_REPLACE_RETRY_SECONDS = 0.02
 
@@ -40,11 +38,11 @@ class TaskStateSnapshot(BaseModel):
     goal: str
     plan: list[str]
     completed_steps: list[str]
-    important_facts: list[TaskFact]
+    global_facts: list[Fact]
     unresolved_issues: list[str]
     completion_criteria: list[str]
     modified_files: list[str]
-    validation_results: list[CommandCallRecord]
+    validation_results: list[ToolCallRecord]
     status: Literal["in_progress", "complete", "blocked"]
 
 
@@ -60,6 +58,7 @@ class AgentContextSnapshot(BaseModel):
     coordinator_id: str | None
     message_history: list[dict[str, Any]]
     conversation_summary: str | None
+    task_facts: list[Fact] = Field(default_factory=list)
     compaction_count: int
     turn_count: int
 
@@ -102,9 +101,9 @@ class RuntimeSnapshot(BaseModel):
     assignments: list[AssignmentRecord]
     tool_call_records: list[ToolCallRecord]
     assignment_history: list[TaskHandoff]
-    pending_completion_events: list[AssignmentCompletionEvent]
+    pending_completion_events: list[AgentCompletionEvent]
     modified_files_by_agent: dict[str, list[str]]
-    validation_results_by_agent: dict[str, list[CommandCallRecord]]
+    validation_results_by_agent: dict[str, list[ToolCallRecord]]
     modification_revisions_by_agent: dict[str, int] = Field(
         default_factory=dict
     )
@@ -113,18 +112,6 @@ class RuntimeSnapshot(BaseModel):
     )
     next_call_id: int
     max_concurrent_assignments: int
-
-    @model_validator(mode="before")
-    @classmethod
-    def migrate_legacy_evidence_records(cls, value: object) -> object:
-        """把 v1/v2 扁平证据列表迁移为 v3 工具调用结果列表。"""
-        if not isinstance(value, dict) or "tool_call_records" in value:
-            return value
-        migrated = dict(value)
-        legacy_records = migrated.pop("evidence_records", [])
-        migrated["tool_call_records"] = legacy_records
-        return migrated
-
 
 class RuntimeStateStore:
     """以同目录临时文件和原子替换维护单个 Runtime 快照。"""
@@ -187,16 +174,16 @@ class RuntimeStateStore:
         snapshot = RuntimeSnapshot.model_validate_json(
             self.path.read_text(encoding="utf-8")
         )
-        if snapshot.version not in SUPPORTED_SNAPSHOT_VERSIONS:
+        if snapshot.version != SNAPSHOT_VERSION:
             raise ValueError(
-                f"不支持的 Runtime 快照版本：{snapshot.version}"
+                f"仅支持当前 Runtime 快照版本：{SNAPSHOT_VERSION}"
             )
         task = snapshot.task_state
         task_state = TaskState(
             goal=task.goal,
             plan=list(task.plan),
             completed_steps=list(task.completed_steps),
-            important_facts=list(task.important_facts),
+            global_facts=list(task.global_facts),
             unresolved_issues=list(task.unresolved_issues),
             completion_criteria=list(task.completion_criteria),
             modified_files=list(task.modified_files),
@@ -217,6 +204,7 @@ class RuntimeStateStore:
                     record.message_history
                 ),
                 conversation_summary=record.conversation_summary,
+                task_facts=list(record.task_facts),
                 compaction_count=record.compaction_count,
                 turn_count=record.turn_count,
             )
@@ -246,21 +234,12 @@ class RuntimeStateStore:
         runtime.validation_results_by_agent = (
             snapshot.validation_results_by_agent
         )
-        if snapshot.version == 1:
-            # 版本 1 没有记录修改与验证之间的先后关系。恢复时宁可要求 worker
-            # 重新验证，也不能根据不完整历史推断最新代码已经通过。
-            runtime.modification_revisions_by_agent = {
-                agent_id: len(paths)
-                for agent_id, paths in runtime.modified_files_by_agent.items()
-            }
-            runtime.validated_revisions_by_agent = {}
-        else:
-            runtime.modification_revisions_by_agent = (
-                snapshot.modification_revisions_by_agent
-            )
-            runtime.validated_revisions_by_agent = (
-                snapshot.validated_revisions_by_agent
-            )
+        runtime.modification_revisions_by_agent = (
+            snapshot.modification_revisions_by_agent
+        )
+        runtime.validated_revisions_by_agent = (
+            snapshot.validated_revisions_by_agent
+        )
         runtime._next_call_id = snapshot.next_call_id
         return runtime
 
@@ -281,6 +260,7 @@ class RuntimeStateStore:
                     coordinator_id=context.coordinator_id,
                     message_history=json.loads(serialized),
                     conversation_summary=context.conversation_summary,
+                    task_facts=list(context.task_facts),
                     compaction_count=context.compaction_count,
                     turn_count=context.turn_count,
                 )

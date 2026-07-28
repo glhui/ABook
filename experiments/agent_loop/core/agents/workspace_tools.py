@@ -14,7 +14,7 @@ from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.toolsets import FunctionToolset, WrapperToolset
 from pydantic_ai.toolsets.abstract import ToolsetTool
 
-from .context import AgentDependencies, ToolCallRecord
+from ..context import AgentDependencies, ToolCallRecord
 
 
 IGNORED_WORKSPACE_DIRECTORIES = frozenset(
@@ -82,12 +82,6 @@ class CommandResult(BaseModel):
     stdout: str
     stderr: str
     timed_out: bool
-
-    @property
-    def evidence_id(self) -> str:
-        """兼容旧调用方；新代码应读取 ``tool_call_id``。"""
-        return self.tool_call_id
-
 
 class WorkspaceTextEdit(BaseModel):
     """一个必须按预期次数命中的精确文本编辑。"""
@@ -295,19 +289,13 @@ def list_workspace_files(
 def read_workspace_file(
     ctx: RunContext[AgentDependencies],
     path: Annotated[
-        str | None,
+        str,
         Field(
+            min_length=1,
             max_length=500,
-            description="工作区根目录下要读取的 UTF-8 文件相对路径；优先使用此字段",
+            description="工作区根目录下要读取的 UTF-8 文件相对路径",
         ),
-    ] = None,
-    file_path: Annotated[
-        str | None,
-        Field(
-            max_length=500,
-            description="兼容字段；仅当 path 未提供时使用，值同样必须是相对路径",
-        ),
-    ] = None,
+    ],
     max_characters: Annotated[
         int,
         Field(
@@ -331,23 +319,9 @@ def read_workspace_file(
 ) -> str:
     """读取 UTF-8 工作区文件；无效路径会反馈给模型重新选择。
 
-    ``path`` 是正式参数。``file_path`` 仅兼容部分模型常用的字段名，避免因
-    参数名差异消耗有限的工具重试次数；两个字段同时给出且内容不一致时会要求
-    模型重新选择唯一文件。两者均未提供时也返回可恢复错误，而非让参数校验直接
-    中止整轮 Agent 调用。
+    ``path`` 必须指向工作区内存在的 UTF-8 文本文件。
     """
-    if path is not None and file_path is not None and path != file_path:
-        raise RecoverableToolError(
-            "path 与 file_path 不能指向不同文件；请只提供 path。"
-        )
-    requested_path = path or file_path
-    if not requested_path:
-        raise RecoverableToolError(
-            "必须提供 path；例如 path='experiments/agent_loop/runner.py'。"
-        )
-    resolved_path = _resolve_workspace_path(
-        ctx.deps.workspace_root, requested_path
-    )
+    resolved_path = _resolve_workspace_path(ctx.deps.workspace_root, path)
     if not resolved_path.is_file():
         raise RecoverableToolError("path 必须指向工作区文件")
     try:
@@ -379,7 +353,7 @@ def read_workspace_file(
         ctx,
         "read_workspace_file",
         {
-            "path": requested_path,
+            "path": path,
             "start_line": start_line,
             "end_line": end_line,
             "max_characters": max_characters,
@@ -881,13 +855,6 @@ def run_powershell_command(
             check=False,
         )
     except subprocess.TimeoutExpired as error:
-        if is_validation:
-            ctx.deps.runtime.record_validation(
-                command=command,
-                exit_code=None,
-                timed_out=True,
-                agent_id=ctx.deps.agent_context.agent_id,
-            )
         stdout = _truncate_command_output(error.stdout)
         stderr = _truncate_command_output(error.stderr)
         evidence_content = (
@@ -906,6 +873,10 @@ def run_powershell_command(
             "truncated" in evidence_content.casefold(),
             status="timed_out",
         )
+        if is_validation:
+            ctx.deps.runtime.record_validation(
+                record, ctx.deps.agent_context.agent_id
+            )
         return CommandResult(
             tool_call_id=record.tool_call_id,
             command=command,
@@ -915,13 +886,6 @@ def run_powershell_command(
             timed_out=True,
         )
 
-    if is_validation:
-        ctx.deps.runtime.record_validation(
-            command=command,
-            exit_code=completed_process.returncode,
-            timed_out=False,
-            agent_id=ctx.deps.agent_context.agent_id,
-        )
     stdout = _truncate_command_output(completed_process.stdout)
     stderr = _truncate_command_output(completed_process.stderr)
     evidence_content = (
@@ -940,6 +904,8 @@ def run_powershell_command(
         evidence_content,
         "truncated" in evidence_content.casefold(),
     )
+    if is_validation:
+        ctx.deps.runtime.record_validation(record, ctx.deps.agent_context.agent_id)
     return CommandResult(
         tool_call_id=record.tool_call_id,
         command=command,
@@ -1048,17 +1014,12 @@ def run_python_validation(
     except subprocess.TimeoutExpired as error:
         stdout = _truncate_command_output(error.stdout)
         stderr = _truncate_command_output(error.stderr)
-        ctx.deps.runtime.record_validation(
-            command=command,
-            exit_code=None,
-            timed_out=True,
-            agent_id=ctx.deps.agent_context.agent_id,
-        )
         evidence_content = f"timed_out=True\nstdout:\n{stdout}\nstderr:\n{stderr}"
         record = _record_tool_call(
             ctx,
             "run_python_validation",
             {
+                "command": command,
                 "validation": validation,
                 "target": target,
                 "pattern": pattern,
@@ -1068,6 +1029,7 @@ def run_python_validation(
             "truncated" in evidence_content.casefold(),
             status="timed_out",
         )
+        ctx.deps.runtime.record_validation(record, ctx.deps.agent_context.agent_id)
         return CommandResult(
             tool_call_id=record.tool_call_id,
             command=command,
@@ -1079,12 +1041,6 @@ def run_python_validation(
 
     stdout = _truncate_command_output(completed_process.stdout)
     stderr = _truncate_command_output(completed_process.stderr)
-    ctx.deps.runtime.record_validation(
-        command=command,
-        exit_code=completed_process.returncode,
-        timed_out=False,
-        agent_id=ctx.deps.agent_context.agent_id,
-    )
     evidence_content = (
         f"exit_code={completed_process.returncode}\n"
         f"stdout:\n{stdout}\nstderr:\n{stderr}"
@@ -1093,6 +1049,7 @@ def run_python_validation(
         ctx,
         "run_python_validation",
         {
+            "command": command,
             "validation": validation,
             "target": target,
             "pattern": pattern,
@@ -1101,6 +1058,7 @@ def run_python_validation(
         evidence_content,
         "truncated" in evidence_content.casefold(),
     )
+    ctx.deps.runtime.record_validation(record, ctx.deps.agent_context.agent_id)
     return CommandResult(
         tool_call_id=record.tool_call_id,
         command=command,

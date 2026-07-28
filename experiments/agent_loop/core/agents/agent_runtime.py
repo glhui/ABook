@@ -4,14 +4,14 @@ from pydantic_ai import Agent, RunContext
 from pydantic_ai.models import Model
 from pydantic_ai.toolsets import FunctionToolset
 
-from .assignment_models import (
+from ..coordination.assignment_models import (
     AssignmentSnapshot,
     TaskAssignmentReceipt,
     TaskAssignmentRequest,
     TaskReport,
 )
-from .context import AgentContext, AgentDependencies, ContextRuntime
-from .orchestration import (
+from ..context import AgentContext, AgentDependencies, ContextRuntime
+from ..coordination.orchestration import (
     assign_tasks,
     cancel_assignment,
     inspect_assignment,
@@ -21,8 +21,8 @@ from .orchestration import (
     send_task_feedback,
     update_task_state,
 )
-from .runner import AgentTurnResult
-from .task_agents import AGENT_TEMPLATES
+from ..runner import AgentTurnResult
+from ..runner.task_agents import AGENT_TEMPLATES
 from .workspace_tools import RetryToolset, create_workspace_toolset
 
 
@@ -59,7 +59,7 @@ def create_coordinator_agent(model: Model) -> Agent[AgentDependencies, str]:
             "真实 tool_call_id，并逐字摘录工具结果中的 quote。任务开始、计划变化或"
             "验证完成后调用 update_task_state。需要其他 Skill 时调用 select_skill。"
             "读取文件时调用 read_workspace_file(path='相对路径')，例如 "
-            "path='experiments/agent_loop/runner.py'；不要使用绝对路径，也不要把 "
+            "path='experiments/agent_loop/core/runner/runner.py'；不要使用绝对路径，也不要把 "
             "path 包装成列表或对象。大文件使用 start_line 和 end_line 分段读取。"
             "修改已有文件优先使用 apply_workspace_edits，把同一文件的相关精确编辑"
             "一次提交；创建新代码或测试文件使用 write_workspace_file，该工具不会"

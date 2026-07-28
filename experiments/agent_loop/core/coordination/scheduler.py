@@ -4,8 +4,8 @@ import asyncio
 import heapq
 from typing import Protocol
 
-from .context import (
-    AssignmentCompletionEvent,
+from ..context import (
+    AgentCompletionEvent,
     AssignmentSession,
     ContextRuntime,
 )
@@ -20,7 +20,7 @@ class AssignmentExecutor(Protocol):
 
     async def __call__(
         self, assignment: AssignmentSession, request: str
-    ) -> AssignmentCompletionEvent:
+    ) -> AgentCompletionEvent:
         """执行一轮任务并返回其最终事件。"""
         ...
 
@@ -81,7 +81,7 @@ class AssignmentScheduler:
         else:
             await self._finish(
                 assignment,
-                AssignmentCompletionEvent(
+                AgentCompletionEvent(
                     assignment_id=assignment.assignment_id,
                     coordinator_id=assignment.coordinator_id,
                     status="cancelled",
@@ -152,7 +152,7 @@ class AssignmentScheduler:
                 asyncio.create_task(
                     self._finish(
                         assignment,
-                        AssignmentCompletionEvent(
+                        AgentCompletionEvent(
                             assignment_id=assignment.assignment_id,
                             coordinator_id=assignment.coordinator_id,
                             status="blocked",
@@ -176,11 +176,11 @@ class AssignmentScheduler:
             heapq.heappush(self._pending, entry)
 
     async def _run(self, assignment: AssignmentSession) -> None:
-        event: AssignmentCompletionEvent
+        event: AgentCompletionEvent
         try:
             event = await self.executor(assignment, assignment.pending_request)
         except asyncio.CancelledError:
-            event = AssignmentCompletionEvent(
+            event = AgentCompletionEvent(
                 assignment_id=assignment.assignment_id,
                 coordinator_id=assignment.coordinator_id,
                 status="cancelled",
@@ -203,7 +203,7 @@ class AssignmentScheduler:
     async def _finish(
         self,
         assignment: AssignmentSession,
-        event: AssignmentCompletionEvent,
+        event: AgentCompletionEvent,
     ) -> None:
         """完成等待句柄并把最终事件交给宿主；处理器失败不改写任务结果。"""
         if event not in self.runtime.pending_completion_events:

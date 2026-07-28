@@ -4,13 +4,13 @@ import asyncio
 from pathlib import Path
 import sys
 
-from experiments.agent_loop.agent_runtime import create_coordinator_agent
-from experiments.agent_loop.context import (
+from experiments.agent_loop.core.agents.agent_runtime import create_coordinator_agent
+from experiments.agent_loop.core.context import (
     ContextRuntime,
     TaskState,
     WorkspaceContextBuilder,
 )
-from experiments.agent_loop.main import create_model
+from experiments.agent_loop.core.main import create_model
 
 from .core import Workflow, WorkflowStep, run_workflow
 

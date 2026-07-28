@@ -7,15 +7,15 @@ from typing import Callable
 
 from pydantic_ai import Agent
 
-from .agent_runtime import initialize_assignment_scheduler, run_coordinator_turn
-from .context import (
+from ..agents.agent_runtime import initialize_assignment_scheduler, run_coordinator_turn
+from ..context import (
     AgentCallEvent,
     AgentContext,
     AgentDependencies,
-    AssignmentCompletionEvent,
+    AgentCompletionEvent,
     ContextRuntime,
 )
-from .runner import AgentTurnResult
+from ..runner import AgentTurnResult
 
 
 EXIT_COMMANDS = frozenset({"/quit", "/exit", "quit", "exit"})
@@ -34,11 +34,11 @@ def format_call_event(event: AgentCallEvent) -> str:
 
 
 def build_assignment_followup_request(
-    events: AssignmentCompletionEvent | list[AssignmentCompletionEvent],
+    events: AgentCompletionEvent | list[AgentCompletionEvent],
 ) -> str:
     """把一批任务事件转换为不会冒充用户输入的协调续跑请求。"""
     event_batch = (
-        [events] if isinstance(events, AssignmentCompletionEvent) else events
+        [events] if isinstance(events, AgentCompletionEvent) else events
     )
     summaries = []
     for event in event_batch:
@@ -94,7 +94,7 @@ class ConversationSession:
         self.input_fn = input_fn
         self.output_fn = output_fn
         self.resume_policy = resume_policy or CoordinatorResumePolicy()
-        self.completion_events: asyncio.Queue[AssignmentCompletionEvent] = (
+        self.completion_events: asyncio.Queue[AgentCompletionEvent] = (
             asyncio.Queue()
         )
 
@@ -106,7 +106,7 @@ class ConversationSession:
         self.output_fn(format_call_event(event))
 
     async def continue_after_assignment(
-        self, event: AssignmentCompletionEvent
+        self, event: AgentCompletionEvent
     ) -> None:
         """把属于当前协调 Agent 的任务完成事件转入会话私有队列。"""
         # 任务完成事件转发器，该函数会在每次任务完成事件发生时被触发。
@@ -140,7 +140,7 @@ class ConversationSession:
             self.runtime.persist()
 
     async def _resume_coordinator(
-        self, batch: list[AssignmentCompletionEvent]
+        self, batch: list[AgentCompletionEvent]
     ) -> AgentTurnResult[str] | None:
         """按有界策略重试协调续跑；耗尽后保留事件供重启恢复。"""
         last_error: Exception | None = None

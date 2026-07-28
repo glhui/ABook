@@ -10,12 +10,12 @@ from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
 from pydantic_ai.models import Model
 from pydantic_ai.usage import RunUsage, UsageLimits
 
-from .context import (
+from ..context import (
     AgentCallEvent,
     AgentContext,
     AgentDependencies,
     ContextRuntime,
-    FactClaim,
+    Fact,
 )
 
 
@@ -47,7 +47,7 @@ class CompactionCheckpoint(BaseModel):
         max_length=8_000,
         description="保留任务进度、关键决定和后续所需背景的简洁历史摘要",
     )
-    facts: list[FactClaim] = Field(
+    facts: list[Fact] = Field(
         default_factory=list,
         max_length=50,
         description="必须带 tool_call_id 与逐字 quote 的可验证事实",
@@ -374,7 +374,7 @@ def _create_compaction_agent(
     ) -> CompactionCheckpoint:
         """在丢弃原历史前拒绝未知证据或虚构 quote。"""
         try:
-            run_context.deps.runtime.resolve_fact_claims(checkpoint.facts)
+            run_context.deps.runtime.validate_facts(checkpoint.facts)
         except ValueError as error:
             raise ModelRetry(str(error)) from error
         return checkpoint
@@ -390,9 +390,11 @@ def _apply_checkpoint(
     retained_messages: list[ModelMessage],
 ) -> None:
     """先沉淀结构化事实与未决事项，再替换原始历史。"""
-    runtime.task_state.merge_facts(
-        runtime.resolve_fact_claims(checkpoint.facts)
-    )
+    validated_facts = runtime.validate_facts(checkpoint.facts)
+    if agent_context.role == "coordinator":
+        runtime.task_state.merge_global_facts(validated_facts)
+    else:
+        runtime.merge_task_facts(agent_context, validated_facts)
     runtime.task_state.merge_unresolved_issues(
         checkpoint.unresolved_issues
     )

@@ -3,9 +3,9 @@
 from pydantic_ai import Agent, ModelRetry, RunContext
 from pydantic_ai.models import Model
 
-from .assignment_models import AgentTemplate, TaskReport
-from .context import AgentDependencies
-from .workspace_tools import create_workspace_toolset
+from ..coordination.assignment_models import AgentTemplate, TaskReport
+from ..context import AgentDependencies
+from ..agents.workspace_tools import create_workspace_toolset
 
 
 AGENT_TEMPLATES = {
@@ -75,30 +75,19 @@ def create_task_agent(
                 "needs_follow_up 或 blocked 交接必须说明未决事项"
             )
         try:
-            resolved_facts = run_context.deps.runtime.resolve_fact_claims(
-                report.facts
+            validated_facts = run_context.deps.runtime.validate_facts(
+                report.task_facts
             )
         except ValueError as error:
             raise ModelRetry(str(error)) from error
-        cited_records = [
-            citation.record
-            for fact in resolved_facts
-            for citation in fact.evidence
-        ]
         unknown_ids = [
-            tool_call_id
-            for tool_call_id in report.tool_call_ids
-            if tool_call_id not in run_context.deps.runtime.tool_call_records
-            or run_context.deps.runtime.tool_call_records[
-                tool_call_id
-            ].agent_id
-            != run_context.deps.agent_context.agent_id
+            citation.tool_call_id
+            for fact in validated_facts
+            for citation in fact.citations
+            if run_context.deps.runtime.tool_call_records[
+                citation.tool_call_id
+            ].agent_id != run_context.deps.agent_context.agent_id
         ]
-        unknown_ids.extend(
-            record.tool_call_id
-            for record in cited_records
-            if record.agent_id != run_context.deps.agent_context.agent_id
-        )
         if unknown_ids:
             raise ModelRetry(
                 "交接引用了当前任务 Agent 未获得的工具调用 ID："

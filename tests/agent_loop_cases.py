@@ -24,7 +24,7 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.tools import ToolDefinition
 
-from experiments.agent_loop.agent_runtime import (
+from experiments.agent_loop.core.agents.agent_runtime import (
     TaskAssignmentRequest,
     assign_tasks,
     cancel_assignment,
@@ -36,31 +36,31 @@ from experiments.agent_loop.agent_runtime import (
     send_task_feedback,
     update_task_state,
 )
-from experiments.agent_loop.context import (
+from experiments.agent_loop.core.context import (
     AgentCallEvent,
     AgentContext,
     AgentDependencies,
-    AssignmentCompletionEvent,
+    AgentCompletionEvent,
     AssignmentSession,
     ContextWindowPolicy,
     ContextRuntime,
-    EvidenceQuoteClaim,
-    FactClaim,
+    EvidenceReference,
+    Fact,
     ProjectInstruction,
     SkillMetadata,
     TaskState,
     WorkspaceContext,
     WorkspaceContextBuilder,
 )
-from experiments.agent_loop.conversation import ConversationSession
-from experiments.agent_loop.main import (
+from experiments.agent_loop.core.coordination.conversation import ConversationSession
+from experiments.agent_loop.core.main import (
     DeepSeekThinkingChatModel,
     run_conversation,
 )
-from experiments.agent_loop.persistence import RuntimeStateStore
-from experiments.agent_loop.runner import AgentCallLimits, AgentRunner
-from experiments.agent_loop.scheduler import AssignmentScheduler
-from experiments.agent_loop.workspace_tools import (
+from experiments.agent_loop.core.persistence import RuntimeStateStore
+from experiments.agent_loop.core.runner import AgentCallLimits, AgentRunner
+from experiments.agent_loop.core.coordination.scheduler import AssignmentScheduler
+from experiments.agent_loop.core.agents.workspace_tools import (
     RecoverableToolError,
     WorkspaceTextEdit,
     apply_workspace_edits,
@@ -228,12 +228,12 @@ class WorkspaceContextBuilderTests(unittest.TestCase):
         runtime.persistence_handler = state_store.save
 
         def register(index: int) -> None:
-            runtime.register_evidence(
-                "file_read",
-                f"file-{index}.txt",
-                "concurrent test",
-                f"content-{index}",
-                coordinator.agent_id,
+            runtime.record_tool_call(
+                tool_name="read_workspace_file",
+                request={"path": f"file-{index}.txt"},
+                result_content=f"content-{index}",
+                result_truncated=False,
+                agent_id=coordinator.agent_id,
             )
 
         with ThreadPoolExecutor(max_workers=8) as executor:
@@ -243,49 +243,11 @@ class WorkspaceContextBuilderTests(unittest.TestCase):
 
         self.assertIsNotNone(restored)
         assert restored is not None
-        self.assertEqual(20, len(restored.evidence_records))
+        self.assertEqual(20, len(restored.tool_call_records))
         self.assertEqual(
             [],
             list((self.workspace_root / ".abook").glob("*.tmp")),
         )
-
-    def test_runtime_snapshot_migrates_legacy_evidence_records(self) -> None:
-        """v2 快照中的扁平证据记录恢复为 v3 ToolCallRecord。"""
-        workspace_context = WorkspaceContextBuilder(
-            self.workspace_root, self.skills_root
-        ).build()
-        runtime = ContextRuntime(workspace_context, TaskState(goal="快照迁移"))
-        runtime.create_agent_context(
-            "coordinator", "快照迁移", "general", role="coordinator"
-        )
-        state_store = RuntimeStateStore(self.workspace_root / "state.json")
-        state_store.save(runtime)
-        snapshot = json.loads(state_store.path.read_text(encoding="utf-8"))
-        snapshot["version"] = 2
-        snapshot["evidence_records"] = [
-            {
-                "evidence_id": "evidence-7",
-                "agent_id": "coordinator",
-                "kind": "file_read",
-                "source": "src/config.py",
-                "detail": "lines 1-2",
-                "content": "ABOOK_MODEL=test",
-            }
-        ]
-        snapshot.pop("tool_call_records")
-        state_store.path.write_text(
-            json.dumps(snapshot), encoding="utf-8"
-        )
-
-        restored = state_store.load(workspace_context)
-
-        self.assertIsNotNone(restored)
-        assert restored is not None
-        record = restored.tool_call_records["evidence-7"]
-        self.assertEqual("file_read", record.tool_name)
-        self.assertEqual("src/config.py", record.request["legacy_source"])
-        self.assertEqual("lines 1-2", record.request["legacy_detail"])
-        self.assertEqual("ABOOK_MODEL=test", record.result_content)
 
     def test_tool_call_record_preserves_structured_request(self) -> None:
         """通用调用记录保留宿主接受的结构化请求。"""
@@ -337,8 +299,8 @@ class WorkspaceContextBuilderTests(unittest.TestCase):
                     working_directory=Path(external_directory),
                 )
 
-    def test_task_agent_state_hides_other_agent_evidence(self) -> None:
-        """任务 Agent 只看到自己的证据，协调 Agent 可汇总全部证据。"""
+    def test_runtime_state_does_not_render_tool_call_catalog(self) -> None:
+        """工具记录仅供引用校验，不会作为每轮 Runtime 状态目录注入。"""
         runtime = ContextRuntime(
             WorkspaceContextBuilder(
                 self.workspace_root, self.skills_root
@@ -362,19 +324,19 @@ class WorkspaceContextBuilderTests(unittest.TestCase):
             role="task",
             coordinator_id="coordinator",
         )
-        runtime.register_evidence(
-            "file_read",
-            "first.txt",
-            "lines 1-2",
-            "first",
-            first_task_context.agent_id,
+        runtime.record_tool_call(
+            tool_name="read_workspace_file",
+            request={"path": "first.txt"},
+            result_content="first",
+            result_truncated=False,
+            agent_id=first_task_context.agent_id,
         )
-        runtime.register_evidence(
-            "file_read",
-            "second.txt",
-            "lines 1-2",
-            "second",
-            second_task_context.agent_id,
+        runtime.record_tool_call(
+            tool_name="read_workspace_file",
+            request={"path": "second.txt"},
+            result_content="second",
+            result_truncated=False,
+            agent_id=second_task_context.agent_id,
         )
 
         first_prompt = runtime.build_user_prompt(first_task_context, "继续")
@@ -382,10 +344,10 @@ class WorkspaceContextBuilderTests(unittest.TestCase):
             coordinator_context, "汇总"
         )
 
-        self.assertIn("tool-call-1", first_prompt)
+        self.assertNotIn("tool-call-1", first_prompt)
         self.assertNotIn("tool-call-2", first_prompt)
-        self.assertIn("tool-call-1", coordinator_prompt)
-        self.assertIn("tool-call-2", coordinator_prompt)
+        self.assertNotIn("tool-call-1", coordinator_prompt)
+        self.assertNotIn("tool-call-2", coordinator_prompt)
 
     def test_runtime_event_channels_support_multiple_subscribers(self) -> None:
         """日志和宿主可同时订阅事件，取消一方不会覆盖另一方。"""
@@ -586,9 +548,9 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual("修改和验证均已完成", result.output)
         self.assertEqual("VALUE = 2\n", final_content)
         self.assertEqual(
-            [1, 0],
+            ["exit_code=1", "exit_code=0"],
             [
-                validation.exit_code
+                validation.result_content.splitlines()[0]
                 for validation in runtime.task_state.validation_results
             ],
         )
@@ -693,7 +655,6 @@ class AgentRuntimeTests(unittest.TestCase):
                             args={
                                 "status": "completed",
                                 "summary": "后台检查完成",
-                                "tool_call_ids": [],
                                 "unresolved_issues": [],
                                 "recommended_next_actions": [],
                             },
@@ -872,7 +833,7 @@ class AgentRuntimeTests(unittest.TestCase):
                 input_fn=lambda _prompt: "/quit",
                 output_fn=lambda _message: None,
             )
-            event = AssignmentCompletionEvent(
+            event = AgentCompletionEvent(
                 assignment_id="worker-1",
                 coordinator_id=coordinator_context.agent_id,
                 status="completed",
@@ -938,12 +899,12 @@ class AgentRuntimeTests(unittest.TestCase):
             )
             agent = create_coordinator_agent(FunctionModel(model_function))
             run_test_agent(agent, runtime, coordinator_context)
-            runtime.register_evidence(
-                "file_read",
-                "context.py",
-                "characters 1-20 of 20",
-                "上下文规则",
-                coordinator_context.agent_id,
+            runtime.record_tool_call(
+                tool_name="read_workspace_file",
+                request={"path": "context.py"},
+                result_content="上下文规则",
+                result_truncated=False,
+                agent_id=coordinator_context.agent_id,
             )
             runtime.context_window = ContextWindowPolicy(
                 window_tokens=20, compaction_ratio=0.70
@@ -972,7 +933,7 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("第二轮回答", serialized_history)
         self.assertEqual(
             "已确认上下文规则",
-            runtime.task_state.important_facts[0].statement,
+            runtime.task_state.global_facts[0].statement,
         )
         self.assertEqual(["继续第二轮"], runtime.task_state.unresolved_issues)
         self.assertEqual(
@@ -1032,23 +993,23 @@ class AgentRuntimeTests(unittest.TestCase):
             tool_context = SimpleNamespace(
                 deps=AgentDependencies(runtime, coordinator_context)
             )
-            evidence = runtime.register_evidence(
-                "file_read",
-                "context.py",
-                "lines 1-20",
-                "class TaskState: Runtime state",
-                coordinator_context.agent_id,
+            evidence = runtime.record_tool_call(
+                tool_name="read_workspace_file",
+                request={"path": "context.py"},
+                result_content="class TaskState: Runtime state",
+                result_truncated=False,
+                agent_id=coordinator_context.agent_id,
             )
 
             rendered_state = update_task_state(
                 tool_context,
                 plan=["定义状态", "运行测试"],
                 completed_steps=["分析现状"],
-                important_facts=[
-                    FactClaim(
+                global_facts=[
+                    Fact(
                         statement="TaskState 属于 Runtime",
                         citations=[
-                            EvidenceQuoteClaim(
+                            EvidenceReference(
                                 tool_call_id=evidence.tool_call_id,
                                 quote="class TaskState",
                             )
@@ -1059,11 +1020,11 @@ class AgentRuntimeTests(unittest.TestCase):
             )
             update_task_state(
                 tool_context,
-                important_facts=[
-                    FactClaim(
+                global_facts=[
+                    Fact(
                         statement="TaskState 属于 Runtime",
                         citations=[
-                            EvidenceQuoteClaim(
+                            EvidenceReference(
                                 tool_call_id=evidence.tool_call_id,
                                 quote="class TaskState",
                             )
@@ -1079,11 +1040,11 @@ class AgentRuntimeTests(unittest.TestCase):
         )
         self.assertEqual([], runtime.task_state.modified_files)
         self.assertEqual([], runtime.task_state.validation_results)
-        self.assertEqual(1, len(runtime.task_state.important_facts))
+        self.assertEqual(1, len(runtime.task_state.global_facts))
         self.assertEqual([], runtime.task_state.unresolved_issues)
         self.assertIn("TaskState 属于 Runtime", rendered_state)
         self.assertIn("tool-call-1", rendered_state)
-        self.assertIn("tool-call-1 (file_read)", rendered_state)
+        self.assertIn("tool-call-1;", rendered_state)
 
     def test_update_task_state_rejects_unknown_evidence(self) -> None:
         """模型不能把不存在的工具结果登记为已证实事实。"""
@@ -1100,11 +1061,11 @@ class AgentRuntimeTests(unittest.TestCase):
             ):
                 update_task_state(
                     tool_context,
-                    important_facts=[
-                        FactClaim(
+                    global_facts=[
+                        Fact(
                             statement="未经工具证实的事实",
                             citations=[
-                                EvidenceQuoteClaim(
+                                EvidenceReference(
                                     tool_call_id="tool-call-99",
                                     quote="不存在",
                                 )
@@ -1119,12 +1080,12 @@ class AgentRuntimeTests(unittest.TestCase):
             runtime, coordinator_context = create_test_runtime(
                 Path(workspace_directory)
             )
-            evidence = runtime.register_evidence(
-                "file_read",
-                "auth.py",
-                "characters 1-30 of 30",
-                "API_KEY = settings.api_key",
-                coordinator_context.agent_id,
+            evidence = runtime.record_tool_call(
+                tool_name="read_workspace_file",
+                request={"path": "auth.py"},
+                result_content="API_KEY = settings.api_key",
+                result_truncated=False,
+                agent_id=coordinator_context.agent_id,
             )
 
             with self.assertRaisesRegex(
@@ -1134,11 +1095,11 @@ class AgentRuntimeTests(unittest.TestCase):
                     SimpleNamespace(
                         deps=AgentDependencies(runtime, coordinator_context)
                     ),
-                    important_facts=[
-                        FactClaim(
+                    global_facts=[
+                        Fact(
                             statement="认证使用 OAuth",
                             citations=[
-                                EvidenceQuoteClaim(
+                                EvidenceReference(
                                     tool_call_id=evidence.tool_call_id,
                                     quote="OAuth",
                                 )
@@ -1195,43 +1156,6 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("missing.txt", retry_parts[0].content)
         self.assertEqual(2, result.usage.requests)
 
-    def test_read_file_accepts_file_path_compatibility_field(self) -> None:
-        """常见的 file_path 字段可读取文件，不消耗参数校验重试次数。"""
-        model_call_count = 0
-
-        def model_function(_messages, _agent_info):
-            nonlocal model_call_count
-            model_call_count += 1
-            if model_call_count == 1:
-                return ModelResponse(
-                    parts=[
-                        ToolCallPart(
-                            tool_name="read_workspace_file",
-                            args={
-                                "file_path": "note.txt",
-                                "max_characters": 100,
-                            },
-                        )
-                    ]
-                )
-            return ModelResponse(parts=[TextPart("已读取兼容路径")])
-
-        with tempfile.TemporaryDirectory() as workspace_directory:
-            workspace_root = Path(workspace_directory).resolve()
-            (workspace_root / "note.txt").write_text(
-                "兼容字段内容", encoding="utf-8"
-            )
-            runtime, coordinator_context = create_test_runtime(workspace_root)
-            result = run_test_agent(
-                create_coordinator_agent(FunctionModel(model_function)),
-                runtime,
-                coordinator_context,
-            )
-
-        self.assertEqual("已读取兼容路径", result.output)
-        self.assertEqual(2, result.usage.requests)
-        self.assertEqual(1, result.usage.tool_calls)
-
     def test_missing_read_path_is_a_recoverable_tool_error(self) -> None:
         """漏传路径时返回明确反馈，避免直接耗尽工具参数校验重试。"""
         def model_function(messages, _agent_info):
@@ -1268,7 +1192,7 @@ class AgentRuntimeTests(unittest.TestCase):
         ]
         self.assertEqual("已补充读取参数", result.output)
         self.assertEqual(1, len(retry_parts))
-        self.assertIn("必须提供 path", retry_parts[0].content)
+        self.assertIn("Field required", str(retry_parts[0].content))
 
     def test_rejected_powershell_command_returns_to_model_without_retry(
         self,
@@ -1496,7 +1420,11 @@ class WorkspaceToolTests(unittest.TestCase):
         self.assertEqual(1, len(validations))
         self.assertEqual(
             "python -m compileall -q src/valid.py",
-            validations[0].command,
+            validations[0].request["command"],
+        )
+        self.assertIs(
+            validations[0],
+            self.tool_context.deps.runtime.tool_call_records[result.tool_call_id],
         )
 
     def test_powershell_tool_runs_allowed_command_in_workspace(self) -> None:
@@ -1509,8 +1437,11 @@ class WorkspaceToolTests(unittest.TestCase):
 
         self.assertEqual(0, result.exit_code)
         self.assertFalse(result.timed_out)
-        self.assertIn("src", result.stdout.casefold())
         self.assertEqual("tool-call-1", result.tool_call_id)
+        record = self.tool_context.deps.runtime.tool_call_records[
+            result.tool_call_id
+        ]
+        self.assertEqual("src", record.request["working_directory"])
 
     def test_validation_command_updates_task_state(self) -> None:
         """实际执行的编译命令由宿主记录到 TaskState。"""
@@ -1524,9 +1455,17 @@ class WorkspaceToolTests(unittest.TestCase):
         )
         self.assertNotEqual(0, result.exit_code)
         self.assertEqual(1, len(validations))
-        self.assertEqual("python -m compileall -q src", validations[0].command)
-        self.assertEqual(result.exit_code, validations[0].exit_code)
-        self.assertFalse(validations[0].timed_out)
+        self.assertEqual("python -m compileall -q src", validations[0].request["command"])
+        self.assertTrue(
+            validations[0].result_content.startswith(
+                f"exit_code={result.exit_code}\n"
+            )
+        )
+        self.assertEqual("succeeded", validations[0].status)
+        self.assertIs(
+            validations[0],
+            self.tool_context.deps.runtime.tool_call_records[result.tool_call_id],
+        )
 
     def test_powershell_tool_rejects_mutating_and_compound_commands(
         self,
@@ -1626,7 +1565,6 @@ class TaskCoordinationTests(unittest.TestCase):
             custom_output_args={
                 "status": "completed",
                 "summary": "工作包完成",
-                "tool_call_ids": [],
                 "unresolved_issues": [],
                 "recommended_next_actions": [],
             },
@@ -1669,7 +1607,7 @@ class TaskCoordinationTests(unittest.TestCase):
         self.assertEqual("工作包完成", result.summary)
         self.assertEqual("completed", result.status)
         self.assertEqual(1, result.turn_index)
-        self.assertEqual((), result.evidence)
+        self.assertEqual((), result.task_facts)
         self.assertEqual((), result.modified_files)
         self.assertEqual((), result.validation_results)
         self.assertEqual((), result.unresolved_issues)
@@ -1754,7 +1692,11 @@ class TaskCoordinationTests(unittest.TestCase):
 
         self.assertEqual("completed", result.status)
         self.assertEqual(1, len(result.validation_results))
-        self.assertEqual(0, result.validation_results[0].exit_code)
+        self.assertTrue(
+            result.validation_results[0].result_content.startswith(
+                "exit_code=0\n"
+            )
+        )
         self.assertEqual(
             1, self.runtime.modification_revisions_by_agent[result.agent_id]
         )
@@ -1780,7 +1722,6 @@ class TaskCoordinationTests(unittest.TestCase):
                         args={
                             "status": "completed",
                             "summary": "并行完成",
-                            "tool_call_ids": [],
                             "unresolved_issues": [],
                             "recommended_next_actions": [],
                         },
@@ -1853,7 +1794,6 @@ class TaskCoordinationTests(unittest.TestCase):
                                 else "completed"
                             ),
                             "summary": response,
-                            "tool_call_ids": [],
                             "unresolved_issues": (
                                 ["测试失败"] if first_turn else []
                             ),
@@ -1934,8 +1874,8 @@ class TaskCoordinationTests(unittest.TestCase):
             ),
         )
 
-    def test_task_handoff_resolves_tool_evidence(self) -> None:
-        """协调 Agent 收到结构化摘要和解析后的证据。"""
+    def test_task_handoff_keeps_task_facts_out_of_global_state(self) -> None:
+        """任务事实留在分配交接与任务上下文，不能自动污染大任务状态。"""
         (self.workspace_root / "note.txt").write_text(
             "关键结论", encoding="utf-8"
         )
@@ -1965,7 +1905,7 @@ class TaskCoordinationTests(unittest.TestCase):
                         args={
                             "status": "completed",
                             "summary": "已确认关键结论",
-                            "facts": [
+                            "task_facts": [
                                 {
                                     "statement": "note.txt 包含关键结论",
                                     "citations": [
@@ -1976,7 +1916,6 @@ class TaskCoordinationTests(unittest.TestCase):
                                     ],
                                 }
                             ],
-                            "tool_call_ids": ["tool-call-1"],
                             "unresolved_issues": [],
                             "recommended_next_actions": [],
                         },
@@ -2009,11 +1948,14 @@ class TaskCoordinationTests(unittest.TestCase):
         result = asyncio.run(run_scenario())
 
         self.assertEqual("已确认关键结论", result.summary)
-        self.assertEqual(1, len(result.evidence))
-        self.assertEqual("note.txt", result.evidence[0].request["path"])
-        self.assertEqual(1, len(result.facts))
+        self.assertEqual(1, len(result.task_facts))
         self.assertEqual(
-            "note.txt 包含关键结论", result.facts[0].statement
+            "note.txt 包含关键结论", result.task_facts[0].statement
+        )
+        self.assertEqual([], self.runtime.task_state.global_facts)
+        task_context = self.runtime.agent_contexts[result.agent_id]
+        self.assertEqual(
+            "note.txt 包含关键结论", task_context.task_facts[0].statement
         )
 
     def test_unknown_assignment_is_recoverable(self) -> None:
@@ -2187,14 +2129,14 @@ class TaskCoordinationTests(unittest.TestCase):
 
     def test_scheduler_blocks_missing_restored_dependency(self) -> None:
         """损坏快照中的未知依赖会变为 blocked，而不会抛出 KeyError。"""
-        completion_events: list[AssignmentCompletionEvent] = []
+        completion_events: list[AgentCompletionEvent] = []
 
-        async def completion_handler(event: AssignmentCompletionEvent) -> None:
+        async def completion_handler(event: AgentCompletionEvent) -> None:
             completion_events.append(event)
 
         async def executor(
             assignment: AssignmentSession, request: str
-        ) -> AssignmentCompletionEvent:
+        ) -> AgentCompletionEvent:
             self.fail("缺少依赖的任务不应进入执行器")
 
         async def run_scenario() -> AssignmentSession:

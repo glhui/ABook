@@ -85,13 +85,13 @@ WorkspaceContextBuilder 不调用模型、不枚举工作区文件、不读取�
 `unresolved_issues`。文件全文和重复对话仅由 `summary` 概括，不能被写成已验证
 事实。
 
-`TaskState` 保存当前任务的目标、计划、已完成步骤、重要事实、未决事项、完成
+`TaskState` 保存当前大任务的目标、计划、已完成步骤、全局事实、未决事项、完成
 条件、修改文件、验证结果和总体状态。工作区工具为每次实际完成的调用登记顺序
 `tool_call_id`，同时保存模型实际看到的有界结果文本和请求摘要。
 协调 Agent 通过
-`update_task_state` 提交重要事实时，必须同时提供 ID 和结果中的逐字 `quote`；
-Runtime 验证 quote 确实存在后，才将其合并为长期 `TaskFact`，后续状态更新不会
-覆盖已有事实。未决事项可在问题解决后显式替换。文件修改和验证结果仍只由实际
+`update_task_state` 提交大任务事实时，必须同时提供 ID 和结果中的逐字 `quote`；
+Runtime 验证 quote 确实存在后，才将其合并为 `global_facts`。任务 Agent 的局部事实
+保存在任务交接和对应 Agent 上下文，协调 Agent 需要时重新表述后再提升。未决事项可在问题解决后显式替换。文件修改和验证结果仍只由实际
 工具调用记录。
 
 ## 执行工具
@@ -119,7 +119,7 @@ Runtime 验证 quote 确实存在后，才将其合并为长期 `TaskFact`，后
 不能通过 `..` 或符号链接越过工作区。结果数量、读取字符数和搜索文件数均有
 上限。`.env` 不会被列出、读取或搜索。文本工具在首行返回 `tool_call_id`，命令
 工具在结构化 `CommandResult` 中返回该字段。工具调用结果并非自动成为事实；仅当
-`FactClaim` 引用其实际返回文本中的 quote 并通过 Runtime 校验时，才可作为事实
+`Fact` 引用其实际返回文本中的 quote 并通过 Runtime 校验时，才可作为事实
 依据。
 
 精确替换和新文件创建成功后，Runtime 自动把相对路径加入
@@ -182,14 +182,14 @@ runtime 的命令边界；因此需要分支或工作区状态时，Agent 应通
 这些限制不包含 token 或费用预算。
 
 每轮交接包含 `completed`、`needs_follow_up` 或 `blocked` 状态，以及结构化摘要、
-带逐字引用的事实、已解析证据、实际修改文件、实际验证结果、未决问题和建议下一
-步。事实使用与 TaskState 相同的 ID + quote 校验；修改与验证由宿主根据本轮工具
+带逐字引用的任务事实、实际修改文件、实际验证结果、未决问题和建议下一步。任务
+事实使用与 TaskState 相同的 ID + quote 校验；修改与验证由宿主根据本轮工具
 调用补入，不能由模型自行声称。`completed` 不允许保留未决事项，其他状态必须
 说明未决事项；Runtime 同时校验任务归属和连续轮次。协调 Agent 可检查交接，使用
 `send_task_feedback` 把修正要求交回原执行 Agent，或用 `assign_tasks` 重新分配新的
 工作包。
 
-CLI 把状态持久化到工作区的 `.abook/runtime-state.json`。快照使用版本化 Pydantic
+CLI 把状态持久化到工作区的 `.abook/runtime-state.json`。快照使用当前版本的 Pydantic
 结构并通过同目录临时文件原子替换，包含整体任务状态、各 Agent 消息历史、证据、
 交接、任务调度元数据、修改和验证记录。模型实例、异步锁、协程句柄与回调不会写入
 JSON，而是在启动后重建。同步工具可能由 PydanticAI 在线程池并发执行，因此
@@ -215,7 +215,7 @@ Agent 单独记录修改和验证，避免错误归属副作用。协调续跑�
 实验读取仓库根目录 .env 中的 ABOOK_MODEL、ABOOK_API_KEY 和 ABOOK_BASE_URL：
 
 ~~~powershell
-.\.venv\Scripts\python.exe -m experiments.agent_loop.main "解释当前项目"
+.\.venv\Scripts\python.exe -m experiments.agent_loop.core.main "解释当前项目"
 ~~~
 
 从仓库根目录执行上述命令即可；`-m` 按 Python 模块启动实验，因此不需要输入

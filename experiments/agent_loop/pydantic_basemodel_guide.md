@@ -1,8 +1,8 @@
 # Pydantic `BaseModel` 与 `model_config` 使用指南
 
 > 注意：本文的 `EvidenceRecord` 示例说明早期的扁平证据模型。当前 Runtime 使用
-> `ToolCallRecord` 保存结构化工具调用结果，并以 `tool_call_id` 供 `FactClaim`
-> 引用；请以 `context.py` 中的当前模型为准。
+> `ToolCallRecord` 保存结构化工具调用结果，并以 `tool_call_id` 供 `Fact` 的
+> `EvidenceReference` 引用；请以 `context.py` 中的当前模型为准。
 
 本文介绍 ABook 中使用的 Pydantic 2 模型写法，重点说明 `BaseModel`、
 `ConfigDict`、字段类型、验证和序列化之间的关系。文中的示例使用 Pydantic
@@ -161,8 +161,8 @@ record = EvidenceRecord(
 record.content = "被修改的结果"  # ValidationError
 ```
 
-ABook 的 `EvidenceRecord` 使用它是为了保证：证据一旦登记，就不能被后续逻辑
-悄悄改写。`TaskFact` 和证据引用也使用相同原则，避免已经验证过的结果失去可追溯性。
+ABook 的 `ToolCallRecord` 与轻量事实引用使用它是为了保证：结果一旦登记，就不能被
+后续逻辑悄悄改写，同时避免把完整工具输出重复嵌入每条事实。
 
 `frozen=True` 主要保护模型字段的重新赋值。它不等于对所有嵌套对象做深度不可变
 保护；如果模型中保存了可变的嵌套列表，仍应根据业务需要选择元组、嵌套冻结模型
@@ -212,12 +212,12 @@ class EvidenceRecord(BaseModel):
 from pydantic import BaseModel, Field
 
 
-class FactClaim(BaseModel):
+class Fact(BaseModel):
     statement: str = Field(min_length=1, max_length=2_000)
     evidence_ids: list[str] = Field(min_length=1, max_length=10)
 ```
 
-ABook 中的 `CompactionCheckpoint`、`FactClaim` 和其他模型使用 `Field` 限制模型
+ABook 中的 `CompactionCheckpoint`、`Fact` 和其他模型使用 `Field` 限制模型
 输出的大小，防止异常长的内容消耗过多上下文或持久化空间。
 
 ### 5.4 可选值和默认值
@@ -267,12 +267,12 @@ print(type(fact.citations[0]))
 ABook 的数据链条就是类似的嵌套关系：
 
 ```text
-TaskFact
-    -> EvidenceCitation
-        -> EvidenceRecord
+Fact
+    -> EvidenceReference (tool_call_id + quote)
+        -> ToolCallRecord（由 Runtime 索引）
 ```
 
-这使得保存下来的事实不仅有陈述文本，也保留了已经验证过的证据记录和引用原文。
+这使保存的事实保留陈述和可验证引文，同时不复制完整证据记录。
 
 ## 7. 创建模型时的几种入口
 
@@ -394,11 +394,11 @@ ABOOK_MODEL=demo
 模型提交的结构化内容类似：
 
 ```python
-FactClaim(
+Fact(
     statement="配置文件中声明了模型名称",
     citations=[
-        EvidenceQuoteClaim(
-            evidence_id="evidence-8",
+        EvidenceReference(
+            tool_call_id="tool-call-8",
             quote="ABOOK_MODEL=demo",
         )
     ],
@@ -410,7 +410,7 @@ FactClaim(
 Runtime 会检查：
 
 ```python
-record = runtime.evidence_records.get(citation.evidence_id)
+record = runtime.tool_call_records.get(citation.tool_call_id)
 if record is None:
     raise ValueError("未知证据 ID")
 
@@ -418,9 +418,9 @@ if citation.quote.strip() not in record.content:
     raise ValueError("证据中不存在引用原文")
 ```
 
-验证成功后，`FactClaim` 才会转换成 `TaskFact`，再保存到
-`TaskState.important_facts`。因此模型不能只凭记忆生成一个事实，也不能引用一个
-不存在的证据 ID。
+验证成功后，`Fact` 会按作用域保存：协调 Agent 提交的事实进入
+`TaskState.global_facts`；任务 Agent 提交的事实保留在 `TaskHandoff.task_facts` 与
+对应任务上下文。因此模型不能只凭记忆生成事实，也不能引用不存在的工具调用 ID。
 
 ## 10. `model_config` 的其他常用配置
 

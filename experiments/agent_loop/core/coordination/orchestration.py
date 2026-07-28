@@ -12,20 +12,20 @@ from .assignment_models import (
     TaskAssignmentRequest,
     TaskReport,
 )
-from .context import (
+from ..context import (
     AgentDependencies,
-    AssignmentCompletionEvent,
+    AgentCompletionEvent,
     AssignmentSession,
     ContextRuntime,
-    FactClaim,
+    Fact,
     SKILL_ID_PATTERN,
     SkillRuntime,
     TaskHandoff,
 )
-from .runner import AgentTurnResult
+from ..runner import AgentTurnResult
 from .scheduler import AssignmentScheduler
-from .task_agents import AGENT_TEMPLATES, create_task_agent
-from .workspace_tools import RecoverableToolError
+from ..runner.task_agents import AGENT_TEMPLATES, create_task_agent
+from ..agents.workspace_tools import RecoverableToolError
 
 
 def _normalize_task_items(name: str, items: list[str]) -> list[str]:
@@ -46,12 +46,12 @@ def update_task_state(
         list[str] | None,
         Field(max_length=20, description="替换当前已完成步骤；省略则保持不变"),
     ] = None,
-    important_facts: Annotated[
-        list[FactClaim] | None,
+    global_facts: Annotated[
+        list[Fact] | None,
         Field(
             max_length=20,
             description=(
-                "合并重要事实；每项必须引用 tool_call_id 并逐字摘录支持原文"
+                "合并仅对整个大任务成立的事实；每项必须引用工具调用并逐字摘录"
             ),
         ),
     ] = None,
@@ -76,10 +76,10 @@ def update_task_state(
         task_state.completed_steps = _normalize_task_items(
             "completed_steps", completed_steps
         )
-    if important_facts is not None:
+    if global_facts is not None:
         try:
-            task_state.merge_facts(
-                ctx.deps.runtime.resolve_fact_claims(important_facts)
+            task_state.merge_global_facts(
+                ctx.deps.runtime.validate_facts(global_facts)
             )
         except ValueError as error:
             raise RecoverableToolError(str(error)) from error
@@ -385,7 +385,7 @@ async def _run_assignment_turn(
     runtime: ContextRuntime,
     assignment: AssignmentSession,
     request: str,
-) -> AssignmentCompletionEvent:
+) -> AgentCompletionEvent:
     """在后台完成工作包，保存交接并通知协调 Agent 重新安排。"""
     task_context = runtime.agent_contexts[assignment.agent_id]
     modified_files_before = len(
@@ -394,7 +394,7 @@ async def _run_assignment_turn(
     validation_count_before = len(
         runtime.validation_results_by_agent.get(task_context.agent_id, [])
     )
-    event: AssignmentCompletionEvent
+    event: AgentCompletionEvent
     try:
         if assignment.agent is None:
             raise RuntimeError("任务 Agent 尚未恢复")
@@ -413,7 +413,7 @@ async def _run_assignment_turn(
             validation_count_before,
         )
         runtime.record_handoff(handoff)
-        event = AssignmentCompletionEvent(
+        event = AgentCompletionEvent(
             assignment_id=assignment.assignment_id,
             coordinator_id=assignment.coordinator_id,
             status=handoff.status,
@@ -422,7 +422,7 @@ async def _run_assignment_turn(
     except Exception as error:
         assignment.status = "failed"
         assignment.error = f"{type(error).__name__}: {error}"
-        event = AssignmentCompletionEvent(
+        event = AgentCompletionEvent(
             assignment_id=assignment.assignment_id,
             coordinator_id=assignment.coordinator_id,
             status="failed",
@@ -454,7 +454,7 @@ def initialize_assignment_scheduler(
 
     async def execute(
         assignment: AssignmentSession, request: str
-    ) -> AssignmentCompletionEvent:
+    ) -> AgentCompletionEvent:
         return await _run_assignment_turn(runtime, assignment, request)
 
     scheduler = AssignmentScheduler(runtime, execute)
@@ -540,6 +540,8 @@ def _build_handoff(
         agent_id, []
     )
     validation_results = agent_validation_results[validation_count_before:]
+    task_facts = runtime.validate_facts(report.task_facts)
+    runtime.merge_task_facts(runtime.agent_contexts[agent_id], task_facts)
     return TaskHandoff(
         assignment_id=assignment_id,
         coordinator_id=coordinator_id,
@@ -549,11 +551,7 @@ def _build_handoff(
         turn_index=turn.turn_index,
         status=report.status,
         summary=report.summary,
-        facts=tuple(runtime.resolve_fact_claims(report.facts)),
-        evidence=tuple(
-            runtime.tool_call_records[tool_call_id]
-            for tool_call_id in report.tool_call_ids
-        ),
+        task_facts=tuple(task_facts),
         modified_files=tuple(dict.fromkeys(modified_files)),
         validation_results=tuple(validation_results),
         unresolved_issues=tuple(report.unresolved_issues),

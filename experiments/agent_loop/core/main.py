@@ -14,8 +14,8 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.models.openai import OpenAIChatModelSettings
 from pydantic_ai.providers.openai import OpenAIProvider
 
-from .agent_runtime import create_coordinator_agent
-from .conversation import EXIT_COMMANDS, run_conversation
+from .agents.agent_runtime import create_coordinator_agent
+from .coordination.conversation import EXIT_COMMANDS, run_conversation
 from .context import (
     ContextRuntime,
     TaskState,
@@ -78,7 +78,7 @@ def main() -> None:
     if not initial_request or initial_request.casefold() in EXIT_COMMANDS:
         return
 
-    experiment_root = Path(__file__).parent
+    experiment_root = Path(__file__).parent.parent
     workspace_context = WorkspaceContextBuilder(
         workspace_root=Path.cwd(),
         skills_root=experiment_root / "skills",
