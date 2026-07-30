@@ -1,0 +1,5 @@
+.env
+.abook/
+.venv/
+__pycache__/
+*.py[cod]
