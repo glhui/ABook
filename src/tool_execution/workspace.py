@@ -12,7 +12,7 @@ from tool_execution.policy import ToolApproval, ToolCapability, ToolExecutionCon
 from workspace_tools import BashResult, EditFileResult, ReadFileResult, WorkspaceBashTool, WorkspaceFileTools, WriteFileResult
 
 
-WorkspaceRelativePath = Annotated[str, Field(description="相对于受控工作区根目录的 UTF-8 文本文件路径。")]
+AbsoluteFilePath = Annotated[str, Field(description="位于受控白名单根目录内的 UTF-8 文本文件绝对路径。")]
 StartLine = Annotated[int, Field(description="从 1 开始的首行行号。")]
 EndLine = Annotated[int | None, Field(description="从 1 开始的末行行号，省略时读取至文件末尾。")]
 ExpectedReplacements = Annotated[int, Field(description="旧文本必须出现的次数。")]
@@ -25,7 +25,7 @@ class ToolExecutionDenied(PermissionError):
     pass
 
 
-# 先执行策略校验、审计，再委托无策略的 WorkspaceFileTools 完成文件操作。
+# 先执行策略校验、审计，再委托无策略的绝对路径文件工具完成文件操作。
 class WorkspaceToolExecutor:
     def __init__(
         self: "WorkspaceToolExecutor",
@@ -116,7 +116,7 @@ class WorkspaceToolExecutor:
         self._record(context, "run_bash", Path("."), allowed=True, reason=None)
         return result
 
-    # 根据调用上下文、工作区根目录和保护规则确定允许访问的真实文件路径。
+    # 根据调用上下文、读写根目录白名单和保护规则确定允许访问的真实文件路径。
     def _authorize(
         self: "WorkspaceToolExecutor",
         context: ToolExecutionContext,
@@ -128,20 +128,38 @@ class WorkspaceToolExecutor:
             self._deny(context, operation, Path(path), f"当前 Agent 缺少 {capability.value} 能力。")
 
         requested_path = Path(path)
-        if requested_path.is_absolute():
-            self._deny(context, operation, requested_path, "路径必须相对于工作区根目录。")
-        target_path = (self._policy.workspace_root / requested_path).resolve()
-        try:
-            relative_path = target_path.relative_to(self._policy.workspace_root)
-        except ValueError:
-            self._deny(context, operation, target_path, "路径不得位于工作区之外。")
-        if not relative_path.parts:
-            self._deny(context, operation, target_path, "路径必须指向工作区中的文件。")
-        if self._policy.protected_path_parts.intersection(relative_path.parts):
+        if not requested_path.is_absolute():
+            self._deny(context, operation, requested_path, "路径必须是绝对路径。")
+        target_path = requested_path.resolve()
+        allowed_roots = self._allowed_roots(capability)
+        relative_paths = self._relative_to_allowed_roots(target_path, allowed_roots)
+        if not relative_paths:
+            self._deny(context, operation, target_path, "路径不在允许访问的根目录中。")
+        if any(not relative_path.parts for relative_path in relative_paths):
+            self._deny(context, operation, target_path, "路径必须指向允许根目录中的文件。")
+        if self._policy.protected_path_parts.intersection(target_path.parts):
             self._deny(context, operation, target_path, "路径位于受保护目录中。")
         if target_path.name in self._policy.protected_file_names:
             self._deny(context, operation, target_path, "路径指向受保护文件。")
         return target_path
+
+    # 读取使用只读白名单，修改使用可写白名单，避免外部依赖目录被意外改写。
+    def _allowed_roots(self: "WorkspaceToolExecutor", capability: ToolCapability) -> frozenset[Path]:
+        if capability == ToolCapability.FILE_READ:
+            return self._policy.readable_roots
+        return self._policy.writable_roots
+
+    # 仅保留能包含目标路径的根目录；解析后的路径可阻止符号链接逃逸白名单。
+    def _relative_to_allowed_roots(
+        self: "WorkspaceToolExecutor", target_path: Path, allowed_roots: frozenset[Path]
+    ) -> list[Path]:
+        relative_paths: list[Path] = []
+        for allowed_root in allowed_roots:
+            try:
+                relative_paths.append(target_path.relative_to(allowed_root))
+            except ValueError:
+                continue
+        return relative_paths
 
     # 记录拒绝原因并抛出执行层异常，禁止底层工具开始产生副作用。
     def _deny(
@@ -185,20 +203,20 @@ class AuthorizedWorkspaceTools:
     # 在本轮固定的调用上下文中执行受控读取。
     def read_file(
         self: "AuthorizedWorkspaceTools",
-        path: WorkspaceRelativePath,
+        path: AbsoluteFilePath,
         start_line: StartLine = 1,
         end_line: EndLine = None,
     ) -> ReadFileResult:
         return self._executor.read_file(self._context, path, start_line, end_line)
 
     # 在本轮固定的调用上下文中执行受控整文件写入。
-    def write_file(self: "AuthorizedWorkspaceTools", path: WorkspaceRelativePath, content: str) -> WriteFileResult:
+    def write_file(self: "AuthorizedWorkspaceTools", path: AbsoluteFilePath, content: str) -> WriteFileResult:
         return self._executor.write_file(self._context, path, content)
 
     # 在本轮固定的调用上下文中执行受控精确文本替换。
     def replace_text(
         self: "AuthorizedWorkspaceTools",
-        path: WorkspaceRelativePath,
+        path: AbsoluteFilePath,
         old_text: str,
         new_text: str,
         expected_replacements: ExpectedReplacements = 1,
@@ -217,14 +235,14 @@ class AuthorizedWorkspaceTools:
     def as_pydantic_tools(self: "AuthorizedWorkspaceTools") -> list[Tool[None]]:
         tools: list[Tool[None]] = []
         if ToolCapability.FILE_READ in self._context.capabilities:
-            tools.append(Tool(self.read_file, description="读取受控工作区内的 UTF-8 文本文件，可按行范围读取。"))
+            tools.append(Tool(self.read_file, description="读取受控白名单根目录内的 UTF-8 文本文件绝对路径，可按行范围读取。"))
         if ToolCapability.FILE_WRITE in self._context.capabilities:
-            tools.append(Tool(self.write_file, description="写入受控工作区内的 UTF-8 文本文件；覆盖已有文件需用户确认。"))
+            tools.append(Tool(self.write_file, description="写入受控可写根目录内的 UTF-8 文本文件绝对路径；覆盖已有文件需用户确认。"))
         if ToolCapability.FILE_EDIT in self._context.capabilities:
             tools.append(
                 Tool(
                     self.replace_text,
-                    description="精确替换受控工作区中已有文件的文本；旧文本出现次数必须与预期一致。",
+                    description="精确替换受控可写根目录中已有文件的文本绝对路径；旧文本出现次数必须与预期一致。",
                 )
             )
         if ToolCapability.BASH_EXECUTE in self._context.capabilities and self._executor.has_bash_tool:

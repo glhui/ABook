@@ -17,9 +17,9 @@ class WorkspaceFileToolsReadTests(unittest.TestCase):
             workspace_root = Path(temporary_directory)
             with (workspace_root / "notes.txt").open("w", encoding="utf-8", newline="") as notes_file:
                 notes_file.write("first\nsecond\nthird\n")
-            tools = create_workspace_file_tools(workspace_root)
+            tools = create_workspace_file_tools()
 
-            result = tools.read_file("notes.txt", start_line=2, end_line=2)
+            result = tools.read_file(str(workspace_root / "notes.txt"), start_line=2, end_line=2)
 
             self.assertEqual(result.content, "second\n")
             self.assertEqual(result.start_line, 2)
@@ -27,17 +27,19 @@ class WorkspaceFileToolsReadTests(unittest.TestCase):
             self.assertEqual(result.total_lines, 3)
             self.assertTrue(result.truncated)
 
-    def test_read_file_resolves_relative_path_from_workspace_root(self: "WorkspaceFileToolsReadTests") -> None:
+    def test_read_file_rejects_relative_path(self: "WorkspaceFileToolsReadTests") -> None:
         with TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)
             workspace_root = temporary_root / "workspace"
             workspace_root.mkdir()
-            (temporary_root / "outside.txt").write_text("outside", encoding="utf-8")
-            tools = create_workspace_file_tools(workspace_root)
+            outside_path = temporary_root / "outside.txt"
+            outside_path.write_text("outside", encoding="utf-8")
+            tools = create_workspace_file_tools()
 
-            result = tools.read_file("../outside.txt")
+            with self.assertRaisesRegex(ValueError, "绝对路径"):
+                tools.read_file("outside.txt")
 
-            self.assertEqual(result.content, "outside")
+            self.assertEqual(outside_path.read_text(encoding="utf-8"), "outside")
 
 
 # 验证创建和编辑不会覆盖未经精确匹配确认的内容。
@@ -45,15 +47,15 @@ class WorkspaceFileToolsMutationTests(unittest.TestCase):
     def test_write_file_creates_parent_directories_and_overwrites_existing_file(self: "WorkspaceFileToolsMutationTests") -> None:
         with TemporaryDirectory() as temporary_directory:
             workspace_root = Path(temporary_directory)
-            tools = create_workspace_file_tools(workspace_root)
+            tools = create_workspace_file_tools()
 
-            result = tools.write_file("nested/created.txt", "hello")
+            result = tools.write_file(str(workspace_root / "nested" / "created.txt"), "hello")
 
             self.assertEqual(result.path, str((workspace_root / "nested" / "created.txt").resolve()))
             self.assertEqual(result.bytes_written, 5)
             self.assertEqual((workspace_root / "nested" / "created.txt").read_text(encoding="utf-8"), "hello")
 
-            tools.write_file("nested/created.txt", "replacement")
+            tools.write_file(str(workspace_root / "nested" / "created.txt"), "replacement")
 
             self.assertEqual((workspace_root / "nested" / "created.txt").read_text(encoding="utf-8"), "replacement")
 
@@ -62,16 +64,16 @@ class WorkspaceFileToolsMutationTests(unittest.TestCase):
             workspace_root = Path(temporary_directory)
             target_path = workspace_root / "settings.txt"
             target_path.write_text("enabled=true\nenabled=true\n", encoding="utf-8")
-            tools = create_workspace_file_tools(workspace_root)
+            tools = create_workspace_file_tools()
 
-            result = tools.replace_text("settings.txt", "enabled=true", "enabled=false")
+            result = tools.replace_text(str(target_path), "enabled=true", "enabled=false")
 
             self.assertEqual(result.replacements, 2)
             self.assertEqual(target_path.read_text(encoding="utf-8"), "enabled=false\nenabled=false\n")
 
     def test_as_pydantic_tools_exposes_all_file_operations(self: "WorkspaceFileToolsMutationTests") -> None:
         with TemporaryDirectory() as temporary_directory:
-            tools = create_workspace_file_tools(Path(temporary_directory))
+            tools = create_workspace_file_tools()
 
             agent = Agent(TestModel(), tools=tools.as_pydantic_tools())
 

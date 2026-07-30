@@ -104,7 +104,7 @@ def create_agent() -> Agent[None, str]:
         model_name,
         provider=OpenAIProvider(base_url=base_url, api_key=api_key),
     )
-    workspace_tools = create_workspace_file_tools(ROOT_DIRECTORY)
+    workspace_tools = create_workspace_file_tools()
     bash_tool = WorkspaceBashTool(ROOT_DIRECTORY)
     executor = WorkspaceToolExecutor(
         WorkspaceExecutionPolicy(ROOT_DIRECTORY),

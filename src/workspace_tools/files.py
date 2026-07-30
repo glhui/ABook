@@ -1,4 +1,4 @@
-"""提供受工作区边界约束的文本文件工具。"""
+"""提供接受绝对路径的基础文本文件工具。"""
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,7 +8,7 @@ from pydantic import Field
 from pydantic_ai.tools import Tool
 
 
-WorkspaceRelativePath = Annotated[str, Field(description="相对于工作区根目录的 UTF-8 文本文件路径。")]
+AbsoluteFilePath = Annotated[str, Field(description="UTF-8 文本文件的绝对路径。")]
 StartLine = Annotated[int, Field(description="从 1 开始的首行行号。")]
 EndLine = Annotated[int | None, Field(description="从 1 开始的末行行号，省略时读取至文件末尾。")]
 
@@ -38,15 +38,12 @@ class EditFileResult:
     replacements: int
 
 
-# 将文件读取、写入和替换绑定到一个默认工作区根目录。
+# 提供无授权策略的绝对路径文件操作；访问范围由调用方的执行策略负责。
 class WorkspaceFileTools:
-    def __init__(self: "WorkspaceFileTools", workspace_root: Path) -> None:
-        self._workspace_root = workspace_root.resolve()
-
     # 按行读取 UTF-8 文本，默认返回全部内容并提供总行数以支持后续分段读取。
     def read_file(
         self: "WorkspaceFileTools",
-        path: WorkspaceRelativePath,
+        path: AbsoluteFilePath,
         start_line: StartLine = 1,
         end_line: EndLine = None,
     ) -> ReadFileResult:
@@ -68,7 +65,7 @@ class WorkspaceFileTools:
         )
 
     # 写入 UTF-8 文本文件；调用方负责决定是否允许覆盖和创建父目录。
-    def write_file(self: "WorkspaceFileTools", path: WorkspaceRelativePath, content: str) -> WriteFileResult:
+    def write_file(self: "WorkspaceFileTools", path: AbsoluteFilePath, content: str) -> WriteFileResult:
         target_path = self._resolve_path(path)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         self._write_text(target_path, content)
@@ -77,7 +74,7 @@ class WorkspaceFileTools:
     # 将所有匹配的旧文本替换为新文本，并返回实际替换次数供调用方判断结果。
     def replace_text(
         self: "WorkspaceFileTools",
-        path: WorkspaceRelativePath,
+        path: AbsoluteFilePath,
         old_text: str,
         new_text: str,
     ) -> EditFileResult:
@@ -95,21 +92,24 @@ class WorkspaceFileTools:
         return [
             Tool(
                 self.read_file,
-                description="读取工作区内的 UTF-8 文本文件，可按行范围读取。",
+                description="读取已获授权的 UTF-8 文本文件绝对路径，可按行范围读取。",
             ),
             Tool(
                 self.write_file,
-                description="向工作区中的 UTF-8 文本文件写入完整内容。",
+                description="向已获授权的 UTF-8 文本文件绝对路径写入完整内容。",
             ),
             Tool(
                 self.replace_text,
-                description="将工作区中已有 UTF-8 文本文件内的所有旧文本替换为新文本。",
+                description="将已获授权的 UTF-8 文本文件绝对路径中的所有旧文本替换为新文本。",
             ),
         ]
 
-    # 将相对路径解释为工作区路径；路径授权与隔离由调用此工具的上层负责。
+    # 拒绝相对路径，避免进程当前目录意外成为隐式的访问边界。
     def _resolve_path(self: "WorkspaceFileTools", path: str) -> Path:
-        return self._workspace_root / path
+        target_path = Path(path)
+        if not target_path.is_absolute():
+            raise ValueError("文件路径必须是绝对路径。")
+        return target_path.resolve()
 
     # 使用 UTF-8 和保留换行符的方式读取文本，底层文件错误直接交由调用方处理。
     def _read_text(self: "WorkspaceFileTools", path: Path) -> str:
@@ -122,6 +122,6 @@ class WorkspaceFileTools:
             target_file.write(content)
 
 
-# 创建供多个示例复用的工作区文件工具集合。
-def create_workspace_file_tools(workspace_root: Path) -> WorkspaceFileTools:
-    return WorkspaceFileTools(workspace_root)
+# 创建供多个示例复用的绝对路径文件工具集合。
+def create_workspace_file_tools() -> WorkspaceFileTools:
+    return WorkspaceFileTools()

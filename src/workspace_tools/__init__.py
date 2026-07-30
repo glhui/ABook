@@ -2,6 +2,7 @@
 
 from workspace_tools.bash import BashResult, BashRunner, WorkspaceBashTool
 from workspace_tools.files import (
+    AbsoluteFilePath,
     EditFileResult,
     ReadFileResult,
     WorkspaceFileTools,
@@ -12,6 +13,7 @@ from workspace_tools.files import (
 __all__ = [
     "BashResult",
     "BashRunner",
+    "AbsoluteFilePath",
     "EditFileResult",
     "ReadFileResult",
     "WorkspaceFileTools",

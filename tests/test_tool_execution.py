@@ -30,13 +30,13 @@ class WorkspaceToolExecutorTests(unittest.TestCase):
             context = ToolExecutionContext(agent_id="agent-1", task_id="task-1", capabilities=frozenset())
 
             with self.assertRaisesRegex(ToolExecutionDenied, "file_read"):
-                executor.read_file(context, "note.txt")
+                executor.read_file(context, str(workspace_root / "note.txt"))
 
             event = audit_log.events()[-1]
             self.assertFalse(event.allowed)
             self.assertEqual(event.operation, "read_file")
 
-    def test_read_file_rejects_workspace_escape_and_protected_file(self: "WorkspaceToolExecutorTests") -> None:
+    def test_read_file_rejects_relative_path_and_protected_file(self: "WorkspaceToolExecutorTests") -> None:
         with TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)
             workspace_root = temporary_root / "workspace"
@@ -44,12 +44,71 @@ class WorkspaceToolExecutorTests(unittest.TestCase):
             executor, audit_log = self._create_executor(workspace_root)
             context = self._context(ToolCapability.FILE_READ)
 
-            with self.assertRaisesRegex(ToolExecutionDenied, "工作区之外"):
-                executor.read_file(context, "../outside.txt")
+            with self.assertRaisesRegex(ToolExecutionDenied, "绝对路径"):
+                executor.read_file(context, "outside.txt")
             with self.assertRaisesRegex(ToolExecutionDenied, "受保护文件"):
-                executor.read_file(context, ".env")
+                executor.read_file(context, str(workspace_root / ".env"))
 
             self.assertEqual([event.allowed for event in audit_log.events()], [False, False])
+
+    def test_read_file_allows_absolute_path_in_external_readable_root(self: "WorkspaceToolExecutorTests") -> None:
+        with TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            workspace_root = temporary_root / "workspace"
+            documentation_root = temporary_root / "documentation"
+            workspace_root.mkdir()
+            documentation_root.mkdir()
+            documentation_path = documentation_root / "package.md"
+            documentation_path.write_text("package docs", encoding="utf-8")
+            policy = WorkspaceExecutionPolicy(workspace_root, readable_roots=frozenset({workspace_root, documentation_root}))
+            executor = WorkspaceToolExecutor(policy, create_workspace_file_tools(), InMemoryToolAuditLog())
+            context = self._context(ToolCapability.FILE_READ)
+
+            result = executor.read_file(context, str(documentation_path))
+
+            self.assertEqual(result.content, "package docs")
+
+    def test_read_file_protected_directory_takes_priority_over_readable_root(self: "WorkspaceToolExecutorTests") -> None:
+        with TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            workspace_root = temporary_root / "workspace"
+            protected_root = workspace_root / ".venv"
+            workspace_root.mkdir()
+            protected_root.mkdir()
+            protected_path = protected_root / "metadata.txt"
+            protected_path.write_text("private", encoding="utf-8")
+            policy = WorkspaceExecutionPolicy(
+                workspace_root,
+                readable_roots=frozenset({workspace_root, protected_root}),
+            )
+            executor = WorkspaceToolExecutor(policy, create_workspace_file_tools(), InMemoryToolAuditLog())
+            context = self._context(ToolCapability.FILE_READ)
+
+            with self.assertRaisesRegex(ToolExecutionDenied, "受保护目录"):
+                executor.read_file(context, str(protected_path))
+
+    def test_write_file_rejects_read_only_root(self: "WorkspaceToolExecutorTests") -> None:
+        with TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            workspace_root = temporary_root / "workspace"
+            dependency_root = temporary_root / "dependencies"
+            workspace_root.mkdir()
+            dependency_root.mkdir()
+            dependency_path = dependency_root / "package.json"
+            dependency_path.write_text("{}", encoding="utf-8")
+            policy = WorkspaceExecutionPolicy(workspace_root, readable_roots=frozenset({workspace_root, dependency_root}))
+            executor = WorkspaceToolExecutor(policy, create_workspace_file_tools(), InMemoryToolAuditLog())
+            context = ToolExecutionContext(
+                agent_id="agent-1",
+                task_id="task-1",
+                capabilities=frozenset({ToolCapability.FILE_WRITE}),
+                approvals=frozenset({ToolApproval.OVERWRITE_FILE}),
+            )
+
+            with self.assertRaisesRegex(ToolExecutionDenied, "允许访问"):
+                executor.write_file(context, str(dependency_path), "changed")
+
+            self.assertEqual(dependency_path.read_text(encoding="utf-8"), "{}")
 
     def test_write_file_requires_overwrite_approval(self: "WorkspaceToolExecutorTests") -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -60,7 +119,7 @@ class WorkspaceToolExecutorTests(unittest.TestCase):
             unapproved_context = self._context(ToolCapability.FILE_WRITE)
 
             with self.assertRaisesRegex(ToolExecutionDenied, "覆盖"):
-                executor.write_file(unapproved_context, "note.txt", "after")
+                executor.write_file(unapproved_context, str(target_path), "after")
 
             approved_context = ToolExecutionContext(
                 agent_id="agent-1",
@@ -68,7 +127,7 @@ class WorkspaceToolExecutorTests(unittest.TestCase):
                 capabilities=frozenset({ToolCapability.FILE_WRITE}),
                 approvals=frozenset({ToolApproval.OVERWRITE_FILE}),
             )
-            result = executor.write_file(approved_context, "note.txt", "after")
+            result = executor.write_file(approved_context, str(target_path), "after")
 
             self.assertEqual(result.bytes_written, 5)
             self.assertEqual(target_path.read_text(encoding="utf-8"), "after")
@@ -83,7 +142,7 @@ class WorkspaceToolExecutorTests(unittest.TestCase):
             context = self._context(ToolCapability.FILE_EDIT)
 
             with self.assertRaisesRegex(ToolExecutionDenied, "出现 2 次"):
-                executor.replace_text(context, "note.txt", "value=one", "value=two")
+                executor.replace_text(context, str(target_path), "value=one", "value=two")
 
             self.assertEqual(target_path.read_text(encoding="utf-8"), "value=one\nvalue=one\n")
 
@@ -118,7 +177,7 @@ class WorkspaceToolExecutorTests(unittest.TestCase):
     ) -> tuple[WorkspaceToolExecutor, InMemoryToolAuditLog]:
         audit_log = InMemoryToolAuditLog()
         policy = WorkspaceExecutionPolicy(workspace_root)
-        tools = create_workspace_file_tools(workspace_root)
+        tools = create_workspace_file_tools()
         return WorkspaceToolExecutor(policy, tools, audit_log, bash_tool), audit_log
 
     # 为测试构造具备最小能力集的固定调用上下文。

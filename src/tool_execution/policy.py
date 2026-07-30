@@ -32,12 +32,25 @@ class ToolExecutionContext:
 @dataclass(frozen=True)
 class WorkspaceExecutionPolicy:
     workspace_root: Path
+    readable_roots: frozenset[Path] = frozenset()
+    writable_roots: frozenset[Path] = frozenset()
     protected_path_parts: frozenset[str] = frozenset({".git", ".venv", "__pycache__"})
     protected_file_names: frozenset[str] = frozenset({".env"})
 
-    # 规范化工作区根目录，后续路径比较统一使用真实解析路径。
+    # 规范化工作区和访问根目录；省略白名单时仅允许访问工作区。
     def __post_init__(self: "WorkspaceExecutionPolicy") -> None:
         resolved_root = self.workspace_root.resolve()
         if not resolved_root.is_dir():
             raise ValueError(f"工作区根目录不存在或不是目录：{self.workspace_root}")
         object.__setattr__(self, "workspace_root", resolved_root)
+        object.__setattr__(self, "readable_roots", self._resolve_roots(self.readable_roots, resolved_root))
+        object.__setattr__(self, "writable_roots", self._resolve_roots(self.writable_roots, resolved_root))
+
+    # 每个白名单根目录必须存在，避免拼写错误扩大为不可预期的路径规则。
+    def _resolve_roots(self: "WorkspaceExecutionPolicy", roots: frozenset[Path], default_root: Path) -> frozenset[Path]:
+        configured_roots = roots or frozenset({default_root})
+        resolved_roots = frozenset(root.resolve() for root in configured_roots)
+        invalid_roots = [root for root in resolved_roots if not root.is_dir()]
+        if invalid_roots:
+            raise ValueError(f"允许访问的根目录不存在或不是目录：{invalid_roots[0]}")
+        return resolved_roots
