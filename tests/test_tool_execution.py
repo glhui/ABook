@@ -4,7 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, ModelRetry
 from pydantic_ai.models.test import TestModel
 
 from tool_execution import (
@@ -191,6 +191,23 @@ class WorkspaceToolExecutorTests(unittest.TestCase):
 
 # 验证模型只会获得当前调用上下文已授权的受控工具。
 class AuthorizedWorkspaceToolsTests(unittest.TestCase):
+    def test_authorized_tools_return_retry_for_denied_path(self: "AuthorizedWorkspaceToolsTests") -> None:
+        with TemporaryDirectory() as temporary_directory:
+            workspace_root = Path(temporary_directory) / "workspace"
+            workspace_root.mkdir()
+            outside_path = Path(temporary_directory) / "outside.txt"
+            outside_path.write_text("outside", encoding="utf-8")
+            executor, _ = WorkspaceToolExecutorTests()._create_executor(workspace_root)
+            context = ToolExecutionContext(
+                agent_id="agent-1",
+                task_id="task-1",
+                capabilities=frozenset({ToolCapability.FILE_READ}),
+            )
+            tools = AuthorizedWorkspaceTools(executor, context)
+
+            with self.assertRaisesRegex(ModelRetry, "允许访问"):
+                tools.read_file(str(outside_path))
+
     def test_as_pydantic_tools_registers_controlled_tools(self: "AuthorizedWorkspaceToolsTests") -> None:
         with TemporaryDirectory() as temporary_directory:
             workspace_root = Path(temporary_directory)

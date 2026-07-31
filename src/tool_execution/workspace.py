@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Annotated, NoReturn
 
 from pydantic import Field
+from pydantic_ai import ModelRetry
 from pydantic_ai.tools import Tool
 
 from tool_execution.audit import ToolAuditEvent, ToolAuditLog
@@ -20,7 +21,7 @@ BashCommand = Annotated[str, Field(description="在受控工作区根目录中�
 TimeoutSeconds = Annotated[float | None, Field(description="命令超时秒数；省略时由 Bash 后端决定。")]
 
 
-# 表示执行层拒绝了当前工具调用，信息可直接作为模型的工具失败反馈。
+# 表示执行层拒绝了当前工具调用，包装层会将其转换为模型可纠正的工具反馈。
 class ToolExecutionDenied(PermissionError):
     pass
 
@@ -207,11 +208,17 @@ class AuthorizedWorkspaceTools:
         start_line: StartLine = 1,
         end_line: EndLine = None,
     ) -> ReadFileResult:
-        return self._executor.read_file(self._context, path, start_line, end_line)
+        try:
+            return self._executor.read_file(self._context, path, start_line, end_line)
+        except ToolExecutionDenied as error:
+            raise ModelRetry(str(error)) from error
 
     # 在本轮固定的调用上下文中执行受控整文件写入。
     def write_file(self: "AuthorizedWorkspaceTools", path: AbsoluteFilePath, content: str) -> WriteFileResult:
-        return self._executor.write_file(self._context, path, content)
+        try:
+            return self._executor.write_file(self._context, path, content)
+        except ToolExecutionDenied as error:
+            raise ModelRetry(str(error)) from error
 
     # 在本轮固定的调用上下文中执行受控精确文本替换。
     def replace_text(
@@ -221,7 +228,10 @@ class AuthorizedWorkspaceTools:
         new_text: str,
         expected_replacements: ExpectedReplacements = 1,
     ) -> EditFileResult:
-        return self._executor.replace_text(self._context, path, old_text, new_text, expected_replacements)
+        try:
+            return self._executor.replace_text(self._context, path, old_text, new_text, expected_replacements)
+        except ToolExecutionDenied as error:
+            raise ModelRetry(str(error)) from error
 
     # 在本轮固定的调用上下文中执行经确认的 Bash 命令。
     def run_bash(
@@ -229,7 +239,10 @@ class AuthorizedWorkspaceTools:
         command: BashCommand,
         timeout_seconds: TimeoutSeconds = None,
     ) -> BashResult:
-        return self._executor.run_bash(self._context, command, timeout_seconds)
+        try:
+            return self._executor.run_bash(self._context, command, timeout_seconds)
+        except ToolExecutionDenied as error:
+            raise ModelRetry(str(error)) from error
 
     # 返回仅通过执行层访问底层文件工具的 Pydantic AI 工具定义。
     def as_pydantic_tools(self: "AuthorizedWorkspaceTools") -> list[Tool[None]]:

@@ -6,6 +6,14 @@
 
 可复用的轮次执行逻辑位于 `src/agent_runtime/run_turn.py`。调用方可通过 `on_response` 处理完整模型响应，通过 `on_event` 处理所有工具事件；后续增加事件展示逻辑时，无需复制 Agent 迭代和工具执行代码。
 
+## 测试先行的多 Agent 协作
+
+`python_code_test_agents.py` 演示三个预定义角色的手动协作：协调 Agent 先将需求拆为测试任务和编码任务；测试 Agent 与代码 Agent 并行工作，分别只修改 `tests/` 和生产代码；两者结束后由宿主程序统一执行编译和完整测试命令，并以退出码给出最终结论。三个 Agent 只可访问项目根目录的 `tmp/` 共享隔离区，目录已被 Git 忽略，不会污染项目源码；示例会在文件修改和本地测试命令执行前请求一次显式确认。
+
+```powershell
+.\.venv\Scripts\python.exe examples\python_code_test_agents.py
+```
+
 在项目根目录运行：
 
 ```powershell
