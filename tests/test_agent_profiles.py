@@ -12,6 +12,8 @@ from agent_profiles import (
     create_python_code_context,
     create_python_test_agent,
     create_python_test_context,
+    create_python_validator_agent,
+    create_python_validator_context,
 )
 from tool_execution import (
     InMemoryToolAuditLog,
@@ -76,6 +78,20 @@ class PythonCodeAgentProfileTests(unittest.TestCase):
             agent = create_python_test_agent(TestModel(), executor, create_python_test_context("task-1"))
 
             self.assertEqual(set(agent._function_toolset.tools), {"read_file", "write_file", "replace_text"})
+
+    def test_validator_agent_cannot_read_implementation_or_tests(self: "PythonCodeAgentProfileTests") -> None:
+        with TemporaryDirectory() as temporary_directory:
+            executor = self._create_executor(Path(temporary_directory))
+
+            context = create_python_validator_context("black-box-validation")
+            agent = create_python_validator_agent(TestModel(), executor, context)
+
+            self.assertEqual(context.agent_id, "python-validator")
+            self.assertEqual(
+                context.capabilities,
+                frozenset({ToolCapability.FILE_WRITE, ToolCapability.BASH_EXECUTE}),
+            )
+            self.assertEqual(set(agent._function_toolset.tools), {"write_file"})
 
     def test_task_coordinator_does_not_register_workspace_tools(self: "PythonCodeAgentProfileTests") -> None:
         agent = create_code_test_task_coordinator(TestModel())

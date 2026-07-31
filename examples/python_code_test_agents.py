@@ -24,6 +24,8 @@ from agent_profiles import (
     create_python_code_context,
     create_python_test_agent,
     create_python_test_context,
+    create_python_validator_agent,
+    create_python_validator_context,
 )
 from tool_execution import (
     InMemoryToolAuditLog,
@@ -37,12 +39,11 @@ from workspace_tools import WorkspaceBashTool, create_workspace_file_tools
 
 
 PYTHON_COMMAND: Final[str] = f'& "{sys.executable}"'
-TEST_COMMAND: Final[str] = f"{PYTHON_COMMAND} -m unittest discover -s tests -v"
-TEST_CHECK_COMMAND: Final[str] = f"{PYTHON_COMMAND} -m compileall tests"
+TEST_CHECK_COMMAND: Final[str] = f"{PYTHON_COMMAND} -m compileall case_generator.py solution.py validator.py"
+VALIDATOR_COMMAND: Final[str] = f"{PYTHON_COMMAND} validator.py"
 FINAL_VALIDATION_COMMAND: Final[str] = (
-    f"{TEST_CHECK_COMMAND}; "
-    "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; "
-    f"{TEST_COMMAND}"
+    f"{TEST_CHECK_COMMAND}; if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}; "
+    f"{VALIDATOR_COMMAND}"
 )
 WORKSPACE_RULES: Final[str] = (
     f"受控工作区是 `{WORKSPACE_DIRECTORY}`。所有 read_file、write_file 和 replace_text 的 path 参数必须是"
@@ -75,11 +76,11 @@ def create_executor() -> WorkspaceToolExecutor:
     )
 
 
-# 在两个编写任务结束后，以宿主程序控制的命令提供唯一的验收结论。
+# 在代码、测试和黑盒验证脚本结束后，以宿主程序控制的标准输入输出验收提供唯一结论。
 def validate_workspace(executor: WorkspaceToolExecutor) -> bool:
     context = ToolExecutionContext(
         agent_id="workflow-validator",
-        task_id="validate-code-and-tests",
+        task_id="validate-stdin-stdout-contract",
         capabilities=frozenset({ToolCapability.BASH_EXECUTE}),
         approvals=frozenset({ToolApproval.RUN_BASH}),
     )
@@ -90,9 +91,9 @@ def validate_workspace(executor: WorkspaceToolExecutor) -> bool:
     if result.stderr:
         print(result.stderr, file=sys.stderr)
     if result.exit_code == 0 and not result.timed_out:
-        print("最终验证通过：实现与测试均已完成，测试套件成功。")
+        print("最终验证通过：测试套件与独立标准输入输出验证均已通过。")
         return True
-    print("最终验证失败：实现或测试未满足验收条件。", file=sys.stderr)
+    print("最终验证失败：标准输入输出行为未满足独立验收条件。", file=sys.stderr)
     return False
 
 
@@ -119,15 +120,17 @@ async def run_workflow(problem: str) -> bool:
     )
     test_prompt = (
         f"{WORKSPACE_RULES}\n"
-        "你与代码 Agent 并行工作。你只可创建或修改 `tests` 目录中的文件，禁止修改生产代码。\n"
+        "你与代码 Agent 并行工作。只创建 case_generator.py，禁止修改生产代码和 validator.py。\n"
         f"{allocation.testing_task}\n"
-        f"新增或修改测试后，使用 PowerShell 执行 `{TEST_CHECK_COMMAND}` 的编译检查；"
-        "当前断言失败并不代表测试任务失败。"
+        "case_generator.py 必须只向 stdout 输出 JSON 案例数组，不执行 solution.py，不包含断言或期望结果。"
     )
     code_prompt = (
         f"{WORKSPACE_RULES}\n"
         "你与测试 Agent 并行工作。你只可创建或修改 `tests` 目录之外的生产代码，禁止修改测试。\n"
         f"{allocation.coding_task}\n"
+        "不以性能为目标，优先选择清晰、可证明正确且完整处理边界情况的实现。"
+        "必须提供可执行的 solution.py 作为统一黑盒入口：从 stdin 读取 JSON，向 stdout 输出单个 JSON；"
+        "不得把日志或调试信息写入 stdout，错误应通过非零退出码表示。"
         "测试 Agent 尚在并行写入测试；不要自行运行或宣称最终测试结论。"
         "两个任务结束后由宿主程序统一运行验收命令。"
     )
@@ -143,6 +146,24 @@ async def run_workflow(problem: str) -> bool:
     )
     print(f"\n测试 Agent：\n{test_result.output}")
     print(f"\n代码 Agent：\n{code_result.output}")
+    validator_agent = create_python_validator_agent(
+        model,
+        executor,
+        create_python_validator_context("write-black-box-validator", approvals),
+    )
+    validator_prompt = (
+        f"用户原始需求：{problem}\n"
+        f"协调者分配的验收任务：{allocation.validation_task}\n"
+        f"{WORKSPACE_RULES}\n"
+        f"只允许创建 `{WORKSPACE_DIRECTORY / 'validator.py'}`，不得读取或修改其他文件。\n"
+        "validator.py 必须先通过 subprocess 启动 case_generator.py，从其 stdout 解析 JSON 案例；"
+        "再逐例启动 solution.py，向其 stdin 写入 JSON，从 stdout 解析单个 JSON 结果。"
+        "禁止依赖 unittest、pytest 或现有 tests。\n"
+        "请根据需求推导可证明正确的 oracle，生成覆盖边界情况的 validator.py，"
+        "并用 subprocess 隔离运行 solution.py。"
+    )
+    validator_result = await validator_agent.run(validator_prompt)
+    print(f"\n验证 Agent：\n{validator_result.output}")
     return validate_workspace(executor)
 
 
