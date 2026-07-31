@@ -1,11 +1,9 @@
 """通过 DeepSeek 与 Pydantic AI 进行带工具调用的非流式多轮对话。"""
 
 import asyncio
-import ast
 import json
 import os
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Final
 
@@ -36,40 +34,6 @@ from workspace_tools import WorkspaceBashTool, create_workspace_file_tools
 DIVIDER: Final[str] = "=" * 72
 
 
-# 安全计算器仅允许基础算术表达式，避免执行任意 Python 代码。
-def evaluate_expression(expression: str) -> int | float:
-    expression_tree = ast.parse(expression, mode="eval")
-    return evaluate_node(expression_tree.body)
-
-
-# 递归求值经白名单验证过的抽象语法树节点。
-def evaluate_node(node: ast.expr) -> int | float:
-    if isinstance(node, ast.Constant) and isinstance(node.value, int | float):
-        return node.value
-
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
-        operand = evaluate_node(node.operand)
-        return operand if isinstance(node.op, ast.UAdd) else -operand
-
-    if isinstance(node, ast.BinOp):
-        left = evaluate_node(node.left)
-        right = evaluate_node(node.right)
-        operators: dict[type[ast.operator], object] = {
-            ast.Add: lambda: left + right,
-            ast.Sub: lambda: left - right,
-            ast.Mult: lambda: left * right,
-            ast.Div: lambda: left / right,
-            ast.FloorDiv: lambda: left // right,
-            ast.Mod: lambda: left % right,
-            ast.Pow: lambda: left**right,
-        }
-        operation = operators.get(type(node.op))
-        if operation is not None:
-            return operation()  # type: ignore[operator]
-
-    raise ValueError("表达式只支持数字与 +、-、*、/、//、%、**、括号。")
-
-
 # 将输出限制为单行，便于在终端中检查工具轨迹。
 def compact(value: object) -> str:
     return " ".join(str(value).split())
@@ -79,16 +43,6 @@ def compact(value: object) -> str:
 def print_block(color: str, title: str, content: str) -> None:
     print(f"{color}{DIVIDER}\n{title}{RESET}")
     print(content)
-
-
-# 返回本机当前时间，供模型回答时间相关问题。
-def get_local_time() -> str:
-    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-
-
-# 计算受限的算术表达式，例如 (18 + 6) * 3。
-def calculate(expression: str) -> str:
-    return str(evaluate_expression(expression))
 
 
 # 从 .env 创建指向 OpenAI 兼容 DeepSeek API 的模型。
@@ -123,14 +77,13 @@ def create_agent() -> Agent[None, str]:
     agent = Agent(
         model,
         instructions=(
-            "你是一个中文助手。需要当前本地时间时调用 get_local_time；"
-            "需要精确算术计算时调用 calculate。需要查看工作区文件内容时调用 read_file；"
+            "你是一个中文助手。需要查看工作区文件内容时调用 read_file；"
             "需要列出或搜索工作区文件、查看只读 Git 状态时调用 bash。"
             "当前在 Windows 时，bash 工具实际执行 PowerShell，应使用 Get-ChildItem、rg 或 git status，"
             "不要使用 ls -la 等 Bash 专用参数。"
             "不得调用 bash 修改文件、安装依赖、访问网络或提交 Git。工具调用完成后，用中文简洁说明结果。"
         ),
-        tools=[get_local_time, calculate, *authorized_tools.as_pydantic_tools()],
+        tools=authorized_tools.as_pydantic_tools(),
     )
     return agent
 

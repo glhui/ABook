@@ -25,7 +25,7 @@ class ToolExecutionContext:
     agent_id: str
     task_id: str
     capabilities: frozenset[ToolCapability]
-    approvals: frozenset[ToolApproval] = frozenset()
+    approvals: frozenset[ToolApproval] = frozenset() # 显式用户授权高风险操作。
 
 
 # 集中保存工作区路径边界和受保护目录规则。
