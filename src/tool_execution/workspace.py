@@ -54,7 +54,19 @@ class WorkspaceToolExecutor:
         end_line: int | None = None,
     ) -> ReadFileResult:
         target_path = self._authorize(context, "read_file", ToolCapability.FILE_READ, path)
-        result = self._tools.read_file(str(target_path), start_line, end_line)
+        try:
+            result = self._tools.read_file(str(target_path), start_line, end_line)
+        except FileNotFoundError:
+            result = ReadFileResult(
+                path=str(target_path),
+                exists=False,
+                error="文件不存在，请先创建该文件或检查路径。",
+                content="",
+                start_line=1,
+                end_line=0,
+                total_lines=0,
+                truncated=False,
+            )
         self._record(context, "read_file", target_path, allowed=True, reason=None)
         return result
 
@@ -87,7 +99,10 @@ class WorkspaceToolExecutor:
         if expected_replacements < 1:
             self._deny(context, "replace_text", target_path, "expected_replacements 必须至少为 1。")
 
-        current_content = self._tools.read_file(str(target_path)).content
+        try:
+            current_content = self._tools.read_file(str(target_path)).content
+        except FileNotFoundError:
+            self._deny(context, "replace_text", target_path, "文件不存在，不能编辑。")
         actual_replacements = current_content.count(old_text)
         if actual_replacements != expected_replacements:
             self._deny(
@@ -142,6 +157,8 @@ class WorkspaceToolExecutor:
             self._deny(context, operation, target_path, "路径位于受保护目录中。")
         if target_path.name in self._policy.protected_file_names:
             self._deny(context, operation, target_path, "路径指向受保护文件。")
+        if capability != ToolCapability.FILE_READ and target_path.name in self._policy.read_only_file_names:
+            self._deny(context, operation, target_path, "路径指向只读文件。")
         return target_path
 
     # 读取使用只读白名单，修改使用可写白名单，避免外部依赖目录被意外改写。
@@ -211,7 +228,16 @@ class AuthorizedWorkspaceTools:
         try:
             return self._executor.read_file(self._context, path, start_line, end_line)
         except ToolExecutionDenied as error:
-            raise ModelRetry(str(error)) from error
+            return ReadFileResult(
+                path=path,
+                exists=False,
+                error=str(error),
+                content="",
+                start_line=1,
+                end_line=0,
+                total_lines=0,
+                truncated=False,
+            )
 
     # 在本轮固定的调用上下文中执行受控整文件写入。
     def write_file(self: "AuthorizedWorkspaceTools", path: AbsoluteFilePath, content: str) -> WriteFileResult:
@@ -248,7 +274,15 @@ class AuthorizedWorkspaceTools:
     def as_pydantic_tools(self: "AuthorizedWorkspaceTools") -> list[Tool[None]]:
         tools: list[Tool[None]] = []
         if ToolCapability.FILE_READ in self._context.capabilities:
-            tools.append(Tool(self.read_file, description="读取受控白名单根目录内的 UTF-8 文本文件绝对路径，可按行范围读取。"))
+            tools.append(
+                Tool(
+                    self.read_file,
+                    description=(
+                        "读取受控白名单根目录内的 UTF-8 文本文件绝对路径，可按行范围读取。"
+                        "读取失败时返回 error 字段；应根据错误改用允许的路径或创建目标文件，不要重复相同调用。"
+                    ),
+                )
+            )
         if ToolCapability.FILE_WRITE in self._context.capabilities:
             tools.append(Tool(self.write_file, description="写入受控可写根目录内的 UTF-8 文本文件绝对路径；覆盖已有文件需用户确认。"))
         if ToolCapability.FILE_EDIT in self._context.capabilities:

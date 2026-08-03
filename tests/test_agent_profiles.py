@@ -58,6 +58,7 @@ class PythonCodeAgentProfileTests(unittest.TestCase):
             agent = create_python_code_agent(TestModel(), executor, create_python_code_context("task-1"))
 
             self.assertEqual(set(agent._function_toolset.tools), {"read_file", "write_file", "replace_text"})
+            self.assertEqual(agent.model_settings.get("max_tokens"), 8_192)
 
     def test_create_agent_rejects_identity_outside_fixed_profile(self: "PythonCodeAgentProfileTests") -> None:
         with TemporaryDirectory() as temporary_directory:

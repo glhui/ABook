@@ -17,6 +17,8 @@ EndLine = Annotated[int | None, Field(description="从 1 开始的末行行号�
 @dataclass(frozen=True)
 class ReadFileResult:
     path: str
+    exists: bool
+    error: str | None
     content: str
     start_line: int
     end_line: int
@@ -57,6 +59,8 @@ class WorkspaceFileTools:
         selected_end_line = min(last_line, total_lines)
         return ReadFileResult(
             path=str(target_path),
+            exists=True,
+            error=None,
             content="".join(selected_lines),
             start_line=first_line,
             end_line=selected_end_line,

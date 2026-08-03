@@ -5,6 +5,7 @@ from typing import Final
 from pydantic_ai import Agent
 from pydantic_ai.models import Model
 
+from agent_profiles.model_settings import create_agent_model_settings
 from tool_execution import (
     AuthorizedWorkspaceTools,
     ToolApproval,
@@ -63,6 +64,7 @@ def create_python_code_agent(
     return Agent(
         model,
         instructions=PYTHON_CODE_INSTRUCTIONS,
+        model_settings=create_agent_model_settings(),
         tools=authorized_tools.as_pydantic_tools(),
     )
 

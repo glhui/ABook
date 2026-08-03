@@ -5,6 +5,7 @@ from typing import Final
 from pydantic_ai import Agent
 from pydantic_ai.models import Model
 
+from agent_profiles.model_settings import create_agent_model_settings
 from tool_execution import AuthorizedWorkspaceTools, ToolApproval, ToolCapability, ToolExecutionContext, WorkspaceToolExecutor
 
 
@@ -51,4 +52,9 @@ def create_python_validator_agent(
         raise ValueError(f"验证 Agent 的 agent_id 必须为：{PYTHON_VALIDATOR_AGENT_ID}")
     if context.capabilities - PYTHON_VALIDATOR_CAPABILITIES:
         raise ValueError("验证 Agent 获得了不支持的能力")
-    return Agent(model, instructions=PYTHON_VALIDATOR_INSTRUCTIONS, tools=AuthorizedWorkspaceTools(executor, context).as_pydantic_tools())
+    return Agent(
+        model,
+        instructions=PYTHON_VALIDATOR_INSTRUCTIONS,
+        model_settings=create_agent_model_settings(),
+        tools=AuthorizedWorkspaceTools(executor, context).as_pydantic_tools(),
+    )

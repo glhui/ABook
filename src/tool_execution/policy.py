@@ -29,6 +29,7 @@ class ToolExecutionContext:
 
 
 # 集中保存工作区路径边界和受保护目录规则。
+# 创建方式： workspace_execution_policy = WorkspaceExecutionPolicy(workspace_root=Path("/path/to/workspace"))
 @dataclass(frozen=True)
 class WorkspaceExecutionPolicy:
     workspace_root: Path
@@ -36,8 +37,10 @@ class WorkspaceExecutionPolicy:
     writable_roots: frozenset[Path] = frozenset()
     protected_path_parts: frozenset[str] = frozenset({".git", ".venv", "__pycache__"})
     protected_file_names: frozenset[str] = frozenset({".env"})
+    read_only_file_names: frozenset[str] = frozenset()
 
     # 规范化工作区和访问根目录；省略白名单时仅允许访问工作区。
+    # 因为使用了 dataclass(frozen=True)，所以必须在 __post_init__ 中使用 object.__setattr__ 修改属性。
     def __post_init__(self: "WorkspaceExecutionPolicy") -> None:
         resolved_root = self.workspace_root.resolve()
         if not resolved_root.is_dir():

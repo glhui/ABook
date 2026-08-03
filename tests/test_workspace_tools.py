@@ -22,6 +22,8 @@ class WorkspaceFileToolsReadTests(unittest.TestCase):
             result = tools.read_file(str(workspace_root / "notes.txt"), start_line=2, end_line=2)
 
             self.assertEqual(result.content, "second\n")
+            self.assertTrue(result.exists)
+            self.assertIsNone(result.error)
             self.assertEqual(result.start_line, 2)
             self.assertEqual(result.end_line, 2)
             self.assertEqual(result.total_lines, 3)

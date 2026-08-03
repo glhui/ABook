@@ -4,7 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from pydantic_ai import Agent, ModelRetry
+from pydantic_ai import Agent
 from pydantic_ai.models.test import TestModel
 
 from tool_execution import (
@@ -35,6 +35,18 @@ class WorkspaceToolExecutorTests(unittest.TestCase):
             event = audit_log.events()[-1]
             self.assertFalse(event.allowed)
             self.assertEqual(event.operation, "read_file")
+
+    def test_read_file_missing_path_returns_empty_result(self: "WorkspaceToolExecutorTests") -> None:
+        with TemporaryDirectory() as temporary_directory:
+            workspace_root = Path(temporary_directory)
+            executor, audit_log = self._create_executor(workspace_root)
+            context = self._context(ToolCapability.FILE_READ)
+
+            result = executor.read_file(context, str(workspace_root / "missing.py"))
+
+            self.assertFalse(result.exists)
+            self.assertEqual(result.content, "")
+            self.assertTrue(audit_log.events()[-1].allowed)
 
     def test_read_file_rejects_relative_path_and_protected_file(self: "WorkspaceToolExecutorTests") -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -67,6 +79,32 @@ class WorkspaceToolExecutorTests(unittest.TestCase):
             result = executor.read_file(context, str(documentation_path))
 
             self.assertEqual(result.content, "package docs")
+
+    def test_read_only_file_can_be_read_but_not_modified(self: "WorkspaceToolExecutorTests") -> None:
+        with TemporaryDirectory() as temporary_directory:
+            workspace_root = Path(temporary_directory)
+            instructions_path = workspace_root / "AGENTS.md"
+            instructions_path.write_text("rules", encoding="utf-8")
+            policy = WorkspaceExecutionPolicy(
+                workspace_root,
+                read_only_file_names=frozenset({"AGENTS.md"}),
+            )
+            executor = WorkspaceToolExecutor(policy, create_workspace_file_tools(), InMemoryToolAuditLog())
+
+            read_result = executor.read_file(self._context(ToolCapability.FILE_READ), str(instructions_path))
+
+            self.assertEqual(read_result.content, "rules")
+            with self.assertRaisesRegex(ToolExecutionDenied, "只读文件"):
+                executor.write_file(
+                    ToolExecutionContext(
+                        agent_id="agent-1",
+                        task_id="task-1",
+                        capabilities=frozenset({ToolCapability.FILE_WRITE}),
+                        approvals=frozenset({ToolApproval.OVERWRITE_FILE}),
+                    ),
+                    str(instructions_path),
+                    "changed",
+                )
 
     def test_read_file_protected_directory_takes_priority_over_readable_root(self: "WorkspaceToolExecutorTests") -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -191,7 +229,7 @@ class WorkspaceToolExecutorTests(unittest.TestCase):
 
 # 验证模型只会获得当前调用上下文已授权的受控工具。
 class AuthorizedWorkspaceToolsTests(unittest.TestCase):
-    def test_authorized_tools_return_retry_for_denied_path(self: "AuthorizedWorkspaceToolsTests") -> None:
+    def test_authorized_tools_return_error_result_for_denied_path(self: "AuthorizedWorkspaceToolsTests") -> None:
         with TemporaryDirectory() as temporary_directory:
             workspace_root = Path(temporary_directory) / "workspace"
             workspace_root.mkdir()
@@ -205,8 +243,10 @@ class AuthorizedWorkspaceToolsTests(unittest.TestCase):
             )
             tools = AuthorizedWorkspaceTools(executor, context)
 
-            with self.assertRaisesRegex(ModelRetry, "允许访问"):
-                tools.read_file(str(outside_path))
+            result = tools.read_file(str(outside_path))
+
+            self.assertFalse(result.exists)
+            self.assertIn("允许访问", result.error)
 
     def test_as_pydantic_tools_registers_controlled_tools(self: "AuthorizedWorkspaceToolsTests") -> None:
         with TemporaryDirectory() as temporary_directory:
