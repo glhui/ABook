@@ -3,7 +3,7 @@
 from collections.abc import Callable, Sequence
 from typing import TypeVar
 
-from pydantic_ai import Agent, CallToolsNode
+from pydantic_ai import Agent, AgentRunResult, CallToolsNode
 from pydantic_ai.messages import HandleResponseEvent, ModelMessage, ModelResponse
 
 
@@ -21,6 +21,18 @@ async def run_turn(
     on_response: ModelResponseHandler | None = None,
     on_event: ToolEventHandler | None = None,
 ) -> list[ModelMessage]:
+    _, messages = await run_observed(agent, user_prompt, history, on_response, on_event)
+    return messages
+
+
+# 执行一轮 Agent 请求，实时转发每次模型响应和工具事件，并返回最终结构化结果。
+async def run_observed(
+    agent: Agent[AgentDepsT, AgentOutputT],
+    user_prompt: str,
+    history: Sequence[ModelMessage] | None = None,
+    on_response: ModelResponseHandler | None = None,
+    on_event: ToolEventHandler | None = None,
+) -> tuple[AgentRunResult[AgentOutputT], list[ModelMessage]]:
     async with agent.iter(user_prompt, message_history=history) as agent_run:
         async for node in agent_run:
             if not isinstance(node, CallToolsNode):
@@ -34,4 +46,7 @@ async def run_turn(
                     if on_event is not None:
                         on_event(event)
 
-    return agent_run.all_messages()
+    result = agent_run.result
+    if result is None:
+        raise RuntimeError("Agent 运行结束后未产生结果。")
+    return result, agent_run.all_messages()
