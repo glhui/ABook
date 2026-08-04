@@ -13,7 +13,15 @@ from tool_execution.policy import ToolApproval, ToolCapability, ToolExecutionCon
 from workspace_tools import BashResult, EditFileResult, ReadFileResult, WorkspaceBashTool, WorkspaceFileTools, WriteFileResult
 
 
-AbsoluteFilePath = Annotated[str, Field(description="位于受控白名单根目录内的 UTF-8 文本文件绝对路径。")]
+WorkspaceFilePath = Annotated[
+    str,
+    Field(
+        description=(
+            "受控白名单根目录内的 UTF-8 文本文件路径。工作区内文件可使用相对工作区根目录的路径，"
+            "例如 AGENTS.md 或 src/module.py；外部只读根目录中的文件必须使用绝对路径。"
+        )
+    ),
+]
 StartLine = Annotated[int, Field(description="从 1 开始的首行行号。")]
 EndLine = Annotated[int | None, Field(description="从 1 开始的末行行号，省略时读取至文件末尾。")]
 ExpectedReplacements = Annotated[int, Field(description="旧文本必须出现的次数。")]
@@ -145,7 +153,7 @@ class WorkspaceToolExecutor:
 
         requested_path = Path(path)
         if not requested_path.is_absolute():
-            self._deny(context, operation, requested_path, "路径必须是绝对路径。")
+            requested_path = self._policy.workspace_root / requested_path
         target_path = requested_path.resolve()
         allowed_roots = self._allowed_roots(capability)
         relative_paths = self._relative_to_allowed_roots(target_path, allowed_roots)
@@ -221,7 +229,7 @@ class AuthorizedWorkspaceTools:
     # 在本轮固定的调用上下文中执行受控读取。
     def read_file(
         self: "AuthorizedWorkspaceTools",
-        path: AbsoluteFilePath,
+        path: WorkspaceFilePath,
         start_line: StartLine = 1,
         end_line: EndLine = None,
     ) -> ReadFileResult:
@@ -240,7 +248,7 @@ class AuthorizedWorkspaceTools:
             )
 
     # 在本轮固定的调用上下文中执行受控整文件写入。
-    def write_file(self: "AuthorizedWorkspaceTools", path: AbsoluteFilePath, content: str) -> WriteFileResult:
+    def write_file(self: "AuthorizedWorkspaceTools", path: WorkspaceFilePath, content: str) -> WriteFileResult:
         try:
             return self._executor.write_file(self._context, path, content)
         except ToolExecutionDenied as error:
@@ -249,7 +257,7 @@ class AuthorizedWorkspaceTools:
     # 在本轮固定的调用上下文中执行受控精确文本替换。
     def replace_text(
         self: "AuthorizedWorkspaceTools",
-        path: AbsoluteFilePath,
+        path: WorkspaceFilePath,
         old_text: str,
         new_text: str,
         expected_replacements: ExpectedReplacements = 1,
@@ -278,18 +286,19 @@ class AuthorizedWorkspaceTools:
                 Tool(
                     self.read_file,
                     description=(
-                        "读取受控白名单根目录内的 UTF-8 文本文件绝对路径，可按行范围读取。"
+                        "读取受控白名单根目录内的 UTF-8 文本文件。工作区内可传相对路径，"
+                        "例如 AGENTS.md；外部只读根目录需传绝对路径。可按行范围读取。"
                         "读取失败时返回 error 字段；应根据错误改用允许的路径或创建目标文件，不要重复相同调用。"
                     ),
                 )
             )
         if ToolCapability.FILE_WRITE in self._context.capabilities:
-            tools.append(Tool(self.write_file, description="写入受控可写根目录内的 UTF-8 文本文件绝对路径；覆盖已有文件需用户确认。"))
+            tools.append(Tool(self.write_file, description="写入受控可写根目录内的 UTF-8 文本文件；可传相对工作区根目录的路径，覆盖已有文件需用户确认。"))
         if ToolCapability.FILE_EDIT in self._context.capabilities:
             tools.append(
                 Tool(
                     self.replace_text,
-                    description="精确替换受控可写根目录中已有文件的文本绝对路径；旧文本出现次数必须与预期一致。",
+                    description="精确替换受控可写根目录中已有文件的文本路径；可传相对工作区根目录的路径，旧文本出现次数必须与预期一致。",
                 )
             )
         if ToolCapability.BASH_EXECUTE in self._context.capabilities and self._executor.has_bash_tool:

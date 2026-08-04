@@ -6,6 +6,7 @@ from pydantic_ai import Agent
 from pydantic_ai.models import Model
 
 from agent_profiles.model_settings import create_agent_model_settings
+from agent_profiles.role_instructions import load_role_instructions
 from tool_execution import (
     AuthorizedWorkspaceTools,
     ToolApproval,
@@ -28,7 +29,7 @@ PYTHON_TEST_APPROVALS: Final[frozenset[ToolApproval]] = frozenset(
     {ToolApproval.OVERWRITE_FILE, ToolApproval.RUN_BASH}
 )
 PYTHON_TEST_INSTRUCTIONS: Final[str] = (
-    "你是一名 Python 测试工程师。遵循项目 AGENTS.md 中的编码规范；"
+    "你是一名 Python 测试工程师。先用 read_file 读取工作区根目录的 AGENTS.md 并遵循其中的编码规范；"
     "先阅读现有实现和测试，再为指定行为编写独立、可重复的自动化测试；"
     "测试应定义期望行为，不因当前实现尚未完成而削弱断言；"
     "使用 bash 编译或收集新增测试，确认测试代码可被正常加载。"
@@ -63,7 +64,7 @@ def create_python_test_agent(
     authorized_tools = AuthorizedWorkspaceTools(executor, context)
     return Agent(
         model,
-        instructions=PYTHON_TEST_INSTRUCTIONS,
+        instructions=f"{PYTHON_TEST_INSTRUCTIONS}\n\n{load_role_instructions('python_test')}",
         model_settings=create_agent_model_settings(),
         tools=authorized_tools.as_pydantic_tools(),
     )

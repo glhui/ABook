@@ -48,7 +48,9 @@ class WorkspaceToolExecutorTests(unittest.TestCase):
             self.assertEqual(result.content, "")
             self.assertTrue(audit_log.events()[-1].allowed)
 
-    def test_read_file_rejects_relative_path_and_protected_file(self: "WorkspaceToolExecutorTests") -> None:
+    def test_read_file_resolves_workspace_relative_path_and_rejects_protected_file(
+        self: "WorkspaceToolExecutorTests",
+    ) -> None:
         with TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)
             workspace_root = temporary_root / "workspace"
@@ -56,12 +58,32 @@ class WorkspaceToolExecutorTests(unittest.TestCase):
             executor, audit_log = self._create_executor(workspace_root)
             context = self._context(ToolCapability.FILE_READ)
 
-            with self.assertRaisesRegex(ToolExecutionDenied, "绝对路径"):
-                executor.read_file(context, "outside.txt")
+            instructions_path = workspace_root / "AGENTS.md"
+            instructions_path.write_text("rules", encoding="utf-8")
+
+            result = executor.read_file(context, "AGENTS.md")
+
+            self.assertEqual(result.path, str(instructions_path.resolve()))
+            self.assertEqual(result.content, "rules")
             with self.assertRaisesRegex(ToolExecutionDenied, "受保护文件"):
                 executor.read_file(context, str(workspace_root / ".env"))
 
-            self.assertEqual([event.allowed for event in audit_log.events()], [False, False])
+            self.assertEqual([event.allowed for event in audit_log.events()], [True, False])
+
+    def test_relative_path_cannot_escape_workspace_root(self: "WorkspaceToolExecutorTests") -> None:
+        with TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            workspace_root = temporary_root / "workspace"
+            workspace_root.mkdir()
+            outside_path = temporary_root / "outside.txt"
+            outside_path.write_text("outside", encoding="utf-8")
+            executor, audit_log = self._create_executor(workspace_root)
+            context = self._context(ToolCapability.FILE_READ)
+
+            with self.assertRaisesRegex(ToolExecutionDenied, "允许访问"):
+                executor.read_file(context, "../outside.txt")
+
+            self.assertFalse(audit_log.events()[-1].allowed)
 
     def test_read_file_allows_absolute_path_in_external_readable_root(self: "WorkspaceToolExecutorTests") -> None:
         with TemporaryDirectory() as temporary_directory:

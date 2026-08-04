@@ -21,3 +21,21 @@
 ```
 
 可尝试输入：`现在几点？`、`请计算 (18 + 6) * 3`、`列出当前工作区的文件` 或 `查看 Git 状态`。工具在 Unix 使用 Bash，在 Windows 使用 PowerShell。输入 `/quit` 退出。
+
+## LangGraph 编排的代码—测试—验证—修复
+
+`langgraph_python_code_test_agents.py` 复用原有的协调、代码和测试 Agent，仅用 LangGraph
+管理“任务拆分 → 代码实现 → 测试编写 → 宿主 pytest → 有界修复”的状态迁移。失败时图会在
+`repair` 与 `validate` 节点之间最多循环两次；流程分支只依据用户确认和 pytest 真实退出码。
+
+先安装示例依赖：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install langgraph
+```
+
+再从项目根目录运行：
+
+```powershell
+.\.venv\Scripts\python.exe examples\langgraph_python_code_test_agents.py
+```

@@ -6,6 +6,7 @@ from pydantic_ai import Agent
 from pydantic_ai.models import Model
 
 from agent_profiles.model_settings import create_agent_model_settings
+from agent_profiles.role_instructions import load_role_instructions
 from tool_execution import (
     AuthorizedWorkspaceTools,
     ToolApproval,
@@ -28,7 +29,7 @@ PYTHON_CODE_APPROVALS: Final[frozenset[ToolApproval]] = frozenset(
     {ToolApproval.OVERWRITE_FILE, ToolApproval.RUN_BASH}
 )
 PYTHON_CODE_INSTRUCTIONS: Final[str] = (
-    "你是一名 Python 工程师。遵循项目 AGENTS.md 中的编码规范；"
+    "你是一名 Python 工程师。先用 read_file 读取工作区根目录的 AGENTS.md 并遵循其中的编码规范；"
     "先读取相关代码和测试，再进行最小范围的修改；"
     "修改行为时必须补充或更新测试；"
     "不得修改测试以回避失败；完成后使用 bash 运行相关测试，只有测试通过才可声称任务完成。"
@@ -63,7 +64,7 @@ def create_python_code_agent(
     authorized_tools = AuthorizedWorkspaceTools(executor, context)
     return Agent(
         model,
-        instructions=PYTHON_CODE_INSTRUCTIONS,
+        instructions=f"{PYTHON_CODE_INSTRUCTIONS}\n\n{load_role_instructions('python_code')}",
         model_settings=create_agent_model_settings(),
         tools=authorized_tools.as_pydantic_tools(),
     )

@@ -15,6 +15,7 @@ from agent_profiles import (
     create_python_validator_agent,
     create_python_validator_context,
 )
+from agent_profiles.role_instructions import load_role_instructions
 from tool_execution import (
     InMemoryToolAuditLog,
     ToolApproval,
@@ -59,6 +60,7 @@ class PythonCodeAgentProfileTests(unittest.TestCase):
 
             self.assertEqual(set(agent._function_toolset.tools), {"read_file", "write_file", "replace_text"})
             self.assertEqual(agent.model_settings.get("max_tokens"), 8_192)
+            self.assertTrue(any("Python 代码 Agent 工作说明" in instruction for instruction in agent._instructions))
 
     def test_create_agent_rejects_identity_outside_fixed_profile(self: "PythonCodeAgentProfileTests") -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -79,6 +81,7 @@ class PythonCodeAgentProfileTests(unittest.TestCase):
             agent = create_python_test_agent(TestModel(), executor, create_python_test_context("task-1"))
 
             self.assertEqual(set(agent._function_toolset.tools), {"read_file", "write_file", "replace_text"})
+            self.assertTrue(any("Python 测试 Agent 工作说明" in instruction for instruction in agent._instructions))
 
     def test_validator_agent_cannot_read_implementation_or_tests(self: "PythonCodeAgentProfileTests") -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -98,6 +101,14 @@ class PythonCodeAgentProfileTests(unittest.TestCase):
         agent = create_code_test_task_coordinator(TestModel())
 
         self.assertEqual(set(agent._function_toolset.tools), set())
+
+    def test_each_implementation_role_has_distinct_versioned_instructions(self: "PythonCodeAgentProfileTests") -> None:
+        code_instructions = load_role_instructions("python_code")
+        test_instructions = load_role_instructions("python_test")
+
+        self.assertIn("生产代码", code_instructions)
+        self.assertIn("自动化测试", test_instructions)
+        self.assertNotEqual(code_instructions, test_instructions)
 
     # 创建角色工厂测试所需的受控工作区执行器。
     def _create_executor(self: "PythonCodeAgentProfileTests", workspace_root: Path) -> WorkspaceToolExecutor:
