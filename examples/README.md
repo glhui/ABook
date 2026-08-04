@@ -8,7 +8,7 @@
 
 ## 测试先行的多 Agent 协作
 
-`python_code_test_agents.py` 演示三个预定义角色的手动协作：协调 Agent 先将需求拆为测试任务和编码任务；测试 Agent 与代码 Agent 并行工作，分别只修改 `tests/` 和生产代码；两者结束后由宿主程序统一执行编译和完整测试命令，并以退出码给出最终结论。三个 Agent 只可访问项目根目录的 `tmp/` 共享隔离区，目录已被 Git 忽略，不会污染项目源码；示例会在文件修改和本地测试命令执行前请求一次显式确认。
+`python_code_test_agents.py` 演示三个预定义角色的手动协作：协调 Agent 先将需求拆为测试任务和编码任务；代码 Agent 先完成生产代码，测试 Agent 再完成 `tests/`，因此日志按角色顺序输出；代码 Agent 可在隔离项目中使用 Bash 执行 `python -m py_compile` 检查自己的源码，pytest 仍由宿主统一执行。若失败，宿主会将失败输出反馈给代码 Agent，并最多进行两次只修改生产代码的修复，然后以退出码给出最终结论。三个 Agent 只可访问项目根目录的 `tmp/` 共享隔离区，目录已被 Git 忽略，不会污染项目源码；示例会在文件修改和本地测试命令执行前请求一次显式确认。
 
 ```powershell
 .\.venv\Scripts\python.exe examples\python_code_test_agents.py
