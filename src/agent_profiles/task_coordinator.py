@@ -4,7 +4,8 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent, PromptedOutput
 from pydantic_ai.models import Model
 
-from agent_profiles.model_settings import create_agent_model_settings
+from agent_profiles.model_settings import AgentModelConfig, create_agent_model_settings
+from agent_profiles.role_instructions import load_role_instructions
 
 # 表示测试 Agent 与代码 Agent 共享的最小任务边界。
 class CodeTestTaskAllocation(BaseModel):
@@ -24,10 +25,13 @@ TASK_COORDINATOR_INSTRUCTIONS = (
 
 
 # 创建不具备工作区工具、通过提示词 JSON 输出拆分任务的协调 Agent。
-def create_code_test_task_coordinator(model: Model) -> Agent[None, CodeTestTaskAllocation]:
+def create_code_test_task_coordinator(
+    model: Model,
+    model_config: AgentModelConfig | None = None,
+) -> Agent[None, CodeTestTaskAllocation]:
     return Agent(
         model,
-        instructions=TASK_COORDINATOR_INSTRUCTIONS,
-        model_settings=create_agent_model_settings(),
+        instructions=f"{TASK_COORDINATOR_INSTRUCTIONS}\n\n{load_role_instructions('task_coordinator')}",
+        model_settings=create_agent_model_settings(model_config),
         output_type=PromptedOutput(CodeTestTaskAllocation),
     )

@@ -15,7 +15,7 @@ from examples.python_code_test_agents import (
     create_file_only_context,
     create_isolated_executor,
     create_isolated_run,
-    create_repair_prompt,
+    create_code_retry_prompt,
     print_log_block,
     publish_submission,
 )
@@ -83,9 +83,9 @@ class AgentRunLoggerTests(unittest.TestCase):
         self.assertNotIn('"properties"', log)
 
 
-# 修复提示必须携带失败诊断，同时保持代码 Agent 对测试文件的隔离约束。
-class RepairPromptTests(unittest.TestCase):
-    def test_create_repair_prompt_includes_failure_and_preserves_test_boundary(self: "RepairPromptTests") -> None:
+# 回退到代码编写的提示必须携带失败诊断，同时保持代码 Agent 对测试文件的隔离约束。
+class CodeRetryPromptTests(unittest.TestCase):
+    def test_create_code_retry_prompt_includes_failure_and_preserves_test_boundary(self: "CodeRetryPromptTests") -> None:
         with TemporaryDirectory() as temporary_directory:
             isolated_run = create_isolated_run(
                 Path(temporary_directory),
@@ -93,7 +93,7 @@ class RepairPromptTests(unittest.TestCase):
                 "tests/test_newton.py",
             )
 
-            prompt = create_repair_prompt(
+            prompt = create_code_retry_prompt(
                 isolated_run,
                 "src/newton.py",
                 "tests/test_newton.py",
@@ -106,18 +106,21 @@ class RepairPromptTests(unittest.TestCase):
         self.assertIn(f"只读取 AGENTS.md 和 `{isolated_run.source_file}`", prompt)
         self.assertIn("只修改", prompt)
         self.assertIn("不要读取或修改测试文件", prompt)
+        self.assertIn("不是独立的修复角色", prompt)
+        self.assertIn("必须使用 bash", prompt)
+        self.assertIn("不要使用 `cd` 或 `&&`", prompt)
 
 
-# 代码 Agent 的 Bash 授权仅用于本地编译检查，测试 Agent 保持无 Shell 权限。
+# 两个编写 Agent 都需要 Bash 运行各自文件的本地编译检查。
 class IsolatedAgentContextTests(unittest.TestCase):
-    def test_create_file_only_context_grants_bash_only_when_requested(self: "IsolatedAgentContextTests") -> None:
+    def test_create_file_only_context_grants_bash_when_requested(self: "IsolatedAgentContextTests") -> None:
         code_context = create_file_only_context("python-code", "compile-source", allow_bash=True)
-        test_context = create_file_only_context("python-test", "write-tests")
+        test_context = create_file_only_context("python-test", "compile-tests", allow_bash=True)
 
         self.assertIn("bash_execute", code_context.capabilities)
         self.assertIn("run_bash", code_context.approvals)
-        self.assertNotIn("bash_execute", test_context.capabilities)
-        self.assertNotIn("run_bash", test_context.approvals)
+        self.assertIn("bash_execute", test_context.capabilities)
+        self.assertIn("run_bash", test_context.approvals)
 
     def test_isolated_executor_configures_bash_backend(self: "IsolatedAgentContextTests") -> None:
         with TemporaryDirectory() as temporary_directory:

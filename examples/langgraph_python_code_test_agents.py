@@ -31,7 +31,7 @@ from examples.python_code_test_agents import (
     ANSI_MAGENTA,
     ANSI_RED,
     ANSI_YELLOW,
-    MAX_REPAIR_ATTEMPTS,
+    MAX_VALIDATION_RETRIES,
     RUNS_DIRECTORY,
     AgentRunLogger,
     IsolatedRun,
@@ -39,7 +39,7 @@ from examples.python_code_test_agents import (
     create_isolated_executor,
     create_isolated_run,
     create_model,
-    create_repair_prompt,
+    create_code_retry_prompt,
     print_log_block,
     publish_submission,
     run_pytest,
@@ -57,7 +57,7 @@ class CodeTestWorkflowState(TypedDict, total=False):
     workflow_succeeded: bool
 
 
-WorkflowRoute = Literal["prepare_workspace", "cancel", "repair", "finish"]
+WorkflowRoute = Literal["prepare_workspace", "cancel", "implement_code", "write_tests", "validate", "finish"]
 
 
 # 构建只负责流程转换的 LangGraph，具体 Agent、工具和宿主验证逻辑沿用现有示例。
@@ -96,7 +96,7 @@ def create_code_test_workflow(
         print_log_block("工作流", "2/4 隔离项目", "已创建隔离的 pytest 项目。", ANSI_CYAN)
         return {"isolated_run": isolated_run}
 
-    # 代码节点只负责实现生产代码；验证节点会把失败诊断送往单独的修复节点。
+    # 代码节点负责首次实现和验证失败后的重新编写；测试节点只在首次实现后运行一次。
     async def implement_code(state: CodeTestWorkflowState) -> CodeTestWorkflowState:
         allocation = state["allocation"]
         isolated_run = state["isolated_run"]
@@ -105,17 +105,34 @@ def create_code_test_workflow(
             create_isolated_executor(isolated_run.root_directory),
             create_file_only_context("python-code", "implement-core-function", allow_bash=True),
         )
-        prompt = (
-            f"项目目录是 `{isolated_run.root_directory}`。只读取 AGENTS.md，并只修改 `{isolated_run.source_file}`。\n"
-            f"源码文件：{allocation.source_file}\n测试文件：{allocation.test_file}\n"
-            f"核心函数：{allocation.core_function}\n行为要求：{allocation.requirements}\n"
-            "实现核心函数；不要读取或修改测试文件。修改后可使用 bash 对源码运行 `python -m py_compile`。"
-            "最终 pytest 测试由宿主执行。"
-        )
-        print_log_block("工作流", "3/4 代码 Agent", "已启动。", ANSI_CYAN)
+        retry_attempt = state["repair_attempt"]
+        if "validation_result" in state:
+            retry_attempt += 1
+            validation_result = state["validation_result"]
+            prompt = create_code_retry_prompt(
+                isolated_run,
+                allocation.source_file,
+                allocation.test_file,
+                allocation.core_function,
+                allocation.requirements,
+                validation_result.stdout + validation_result.stderr,
+            )
+            event = f"3/4 代码 Agent（第 {retry_attempt} 次回退）"
+        else:
+            prompt = (
+                f"项目目录是 `{isolated_run.root_directory}`。只读取 AGENTS.md，并只修改 `{isolated_run.source_file}`。\n"
+                f"源码文件：{allocation.source_file}\n测试文件：{allocation.test_file}\n"
+                f"核心函数：{allocation.core_function}\n行为要求：{allocation.requirements}\n"
+                "实现核心函数；不要读取或修改测试文件。"
+                f"必须使用 bash 运行 `python -m py_compile {allocation.source_file}`，不要使用 `cd` 或 `&&`；"
+                "只有编译通过后才能结束本轮。"
+                "最终 pytest 测试由宿主执行。"
+            )
+            event = "3/4 代码 Agent"
+        print_log_block("工作流", event, "已启动。", ANSI_CYAN)
         await run_observed(code_agent, prompt, on_response=code_logger.on_response, on_event=code_logger.on_event)
-        print_log_block("工作流", "3/4 代码 Agent", "已完成核心函数。", ANSI_GREEN)
-        return {}
+        print_log_block("工作流", event, "源码已编译通过。", ANSI_GREEN)
+        return {"repair_attempt": retry_attempt}
 
     # 测试节点根据同一份公开契约编写测试，不能以失败为由修改生产代码。
     async def write_tests(state: CodeTestWorkflowState) -> CodeTestWorkflowState:
@@ -124,17 +141,19 @@ def create_code_test_workflow(
         test_agent = create_python_test_agent(
             model,
             create_isolated_executor(isolated_run.root_directory),
-            create_file_only_context("python-test", "write-pytest-tests"),
+            create_file_only_context("python-test", "write-pytest-tests", allow_bash=True),
         )
         prompt = (
             f"项目目录是 `{isolated_run.root_directory}`。只读取 AGENTS.md，并只修改 `{isolated_run.test_file}`。\n"
             f"源码文件：{allocation.source_file}\n核心函数：{allocation.core_function}\n"
             f"行为要求：{allocation.requirements}\n"
             "使用 pytest 编写正常、边界和错误场景测试；不要读取或修改源码文件。"
+            f"必须使用 bash 运行 `python -m py_compile {allocation.test_file}`，不要使用 `cd` 或 `&&`；"
+            "只有编译通过后才能结束本轮。"
         )
         print_log_block("工作流", "3/4 测试 Agent", "已启动。", ANSI_CYAN)
         await run_observed(test_agent, prompt, on_response=test_logger.on_response, on_event=test_logger.on_event)
-        print_log_block("工作流", "3/4 测试 Agent", "已完成 pytest 测试。", ANSI_GREEN)
+        print_log_block("工作流", "3/4 测试 Agent", "测试文件已编译通过。", ANSI_GREEN)
         return {}
 
     # 宿主独立运行 pytest，并把真实结果写回图状态供条件边选择下一节点。
@@ -178,9 +197,13 @@ def create_code_test_workflow(
 
     # 只依据真实 pytest 退出码和有界重试次数决定循环，避免由模型文本控制流程。
     def route_after_validation(state: CodeTestWorkflowState) -> WorkflowRoute:
-        if state["validation_result"].returncode == 0 or state["repair_attempt"] >= MAX_REPAIR_ATTEMPTS:
+        if state["validation_result"].returncode == 0 or state["repair_attempt"] >= MAX_VALIDATION_RETRIES:
             return "finish"
-        return "repair"
+        return "implement_code"
+
+    # 初次代码编写后必须写测试；后续回退仅重新编写代码，避免覆盖首次生成的测试契约。
+    def route_after_code(state: CodeTestWorkflowState) -> WorkflowRoute:
+        return "validate" if state["repair_attempt"] else "write_tests"
 
     # 确认分支在协调结果生成后发生，保持原示例的交互顺序。
     def route_after_plan(state: CodeTestWorkflowState) -> WorkflowRoute:
@@ -191,16 +214,14 @@ def create_code_test_workflow(
     graph.add_node("implement_code", implement_code)
     graph.add_node("write_tests", write_tests)
     graph.add_node("validate", validate)
-    graph.add_node("repair", repair)
     graph.add_node("finish", finish)
     graph.add_node("cancel", cancel)
     graph.add_edge(START, "plan")
     graph.add_conditional_edges("plan", route_after_plan, {"prepare_workspace": "prepare_workspace", "cancel": "cancel"})
     graph.add_edge("prepare_workspace", "implement_code")
-    graph.add_edge("implement_code", "write_tests")
+    graph.add_conditional_edges("implement_code", route_after_code, {"write_tests": "write_tests", "validate": "validate"})
     graph.add_edge("write_tests", "validate")
-    graph.add_conditional_edges("validate", route_after_validation, {"repair": "repair", "finish": "finish"})
-    graph.add_edge("repair", "validate")
+    graph.add_conditional_edges("validate", route_after_validation, {"implement_code": "implement_code", "finish": "finish"})
     graph.add_edge("finish", END)
     graph.add_edge("cancel", END)
     return graph.compile()
@@ -213,7 +234,7 @@ async def run_workflow(problem: str) -> bool:
 
     # 将交互式确认封装为图节点可调用的无参回调，便于测试时替换。
     def confirm() -> bool:
-        answer = input("允许 Agent 在隔离目录中修改文件，并让代码 Agent 编译源码吗？[y/N] ")
+        answer = input("允许 Agent 在隔离目录中修改文件，并让代码和测试 Agent 编译各自文件吗？[y/N] ")
         return answer.strip().lower() == "y"
 
     with TemporaryDirectory(prefix="langgraph-run-", dir=RUNS_DIRECTORY) as temporary_directory:

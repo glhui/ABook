@@ -7,6 +7,7 @@ import unittest
 from pydantic_ai.models.test import TestModel
 
 from agent_profiles import (
+    AgentModelConfig,
     create_code_test_task_coordinator,
     create_python_code_agent,
     create_python_code_context,
@@ -15,7 +16,8 @@ from agent_profiles import (
     create_python_validator_agent,
     create_python_validator_context,
 )
-from agent_profiles.role_instructions import load_role_instructions
+from agent_profiles.model_settings import create_agent_model_settings
+from agent_profiles.role_instructions import get_role_instruction_definition, load_role_instructions
 from tool_execution import (
     InMemoryToolAuditLog,
     ToolApproval,
@@ -123,6 +125,38 @@ class PythonCodeAgentProfileTests(unittest.TestCase):
         self.assertIn("生产代码", code_instructions)
         self.assertIn("自动化测试", test_instructions)
         self.assertNotEqual(code_instructions, test_instructions)
+
+    # 全部角色说明均由注册表管理，新增 Profile 时不会再把说明散落在工厂代码中。
+    def test_role_instruction_registry_covers_coordinator_and_validator(self: "PythonCodeAgentProfileTests") -> None:
+        coordinator_definition = get_role_instruction_definition("task_coordinator")
+        validator_definition = get_role_instruction_definition("python_validator")
+
+        self.assertFalse(coordinator_definition.accepts_skill_instructions)
+        self.assertFalse(validator_definition.accepts_skill_instructions)
+        self.assertIn("核心函数任务", load_role_instructions("task_coordinator"))
+        self.assertIn("黑盒验收", load_role_instructions("python_validator"))
+
+    # 调用方可以覆盖角色默认的模型输出参数，不需要修改任一角色工厂的常量。
+    def test_agent_factory_applies_per_call_model_config(self: "PythonCodeAgentProfileTests") -> None:
+        with TemporaryDirectory() as temporary_directory:
+            executor = self._create_executor(Path(temporary_directory))
+            agent = create_python_test_agent(
+                TestModel(),
+                executor,
+                create_python_test_context("configured-task"),
+                AgentModelConfig(max_output_tokens=321, temperature=0.4),
+            )
+
+        self.assertEqual(agent.model_settings.get("max_tokens"), 321)
+        self.assertEqual(agent.model_settings.get("temperature"), 0.4)
+
+    # 无效模型参数必须在创建 Agent 前失败，避免把配置错误延迟到模型调用阶段。
+    def test_model_config_rejects_invalid_ranges(self: "PythonCodeAgentProfileTests") -> None:
+        with self.assertRaisesRegex(ValueError, "max_output_tokens"):
+            AgentModelConfig(max_output_tokens=0)
+        with self.assertRaisesRegex(ValueError, "temperature"):
+            AgentModelConfig(temperature=2.1)
+        self.assertEqual(create_agent_model_settings(AgentModelConfig(max_output_tokens=123)).get("max_tokens"), 123)
 
     # 创建角色工厂测试所需的受控工作区执行器。
     def _create_executor(self: "PythonCodeAgentProfileTests", workspace_root: Path) -> WorkspaceToolExecutor:

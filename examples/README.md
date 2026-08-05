@@ -8,16 +8,32 @@
 
 ## 测试先行的多 Agent 协作
 
-`python_code_test_agents.py` 演示三个预定义角色的手动协作：协调 Agent 先将需求拆为测试任务和编码任务；代码 Agent 先完成生产代码，测试 Agent 再完成 `tests/`，因此日志按角色顺序输出；代码 Agent 可在隔离项目中使用 Bash 执行 `python -m py_compile` 检查自己的源码，pytest 仍由宿主统一执行。若失败，宿主会将失败输出反馈给代码 Agent，并最多进行两次只修改生产代码的修复，然后以退出码给出最终结论。三个 Agent 只可访问项目根目录的 `tmp/` 共享隔离区，目录已被 Git 忽略，不会污染项目源码；示例会在文件修改和本地测试命令执行前请求一次显式确认。
+`python_code_test_agents.py` 演示三个预定义角色的手动协作：协调 Agent 先将需求拆为测试任务和编码任务；两个工作包可以并行，但示例刻意让代码 Agent 先完成生产代码、测试 Agent 再完成 `tests/`，因此日志按角色顺序输出。两者都必须在自己的节点使用 Bash 执行 `python -m py_compile`，确认各自文件可编译；pytest 仍由宿主统一执行。若 pytest 失败，工作流只回到代码编写节点，并最多重新编写两次生产代码，测试 Agent 不会再次运行或修改测试。三个 Agent 只可访问项目根目录的 `tmp/` 共享隔离区，目录已被 Git 忽略，不会污染项目源码；示例会在文件修改和本地测试命令执行前请求一次显式确认。
 
 ```powershell
 .\.venv\Scripts\python.exe examples\python_code_test_agents.py
 ```
 
+## Agent Profile 配置
+
+`agent_profile_configuration.py` 是不需要网络或真实密钥的离线示例。它展示如何读取角色说明注册信息、创建代码 Agent 的固定上下文，以及在单次创建时用 `AgentModelConfig` 覆盖 `max_output_tokens` 和 `temperature`。
+
+```powershell
+.\.venv\Scripts\python.exe examples\agent_profile_configuration.py
+```
+
+## Profile 驱动的代码与测试案例
+
+`profile_code_test_case.py` 是可重复的离线闭环：代码角色上下文创建 `normalize_words` 模块，测试角色上下文创建 pytest 用例，宿主再运行真实 pytest。该示例不调用模型，因此适合验证角色 Profile、工作区工具和测试执行基础设施的协作方式。
+
+```powershell
+.\.venv\Scripts\python.exe examples\profile_code_test_case.py
+```
+
 ## 按需 Skill 的代码编写流程
 
 `skill_aware_python_code_agents.py` 复用上面的“任务拆分 → 代码 Agent → 测试 Agent →
-宿主 pytest → 有界修复”流程。启动时只发现 `examples/skill_catalog/` 中的 manifest；
+宿主 pytest → 回到代码编写节点的有界重试”流程。启动时只发现 `examples/skill_catalog/` 中的 manifest；
 协调器给出源码路径和核心函数后，路由器才根据角色、目标路径、任务关键词和符号选择
 最多三个 Skill，并只读取最终选中的 `SKILL.md`。示例 catalog 包含通用核心函数 Skill
 和仅在日期、时间任务中命中的 `datetime` Skill。
@@ -40,8 +56,8 @@
 ## LangGraph 编排的代码—测试—验证—修复
 
 `langgraph_python_code_test_agents.py` 复用原有的协调、代码和测试 Agent，仅用 LangGraph
-管理“任务拆分 → 代码实现 → 测试编写 → 宿主 pytest → 有界修复”的状态迁移。失败时图会在
-`repair` 与 `validate` 节点之间最多循环两次；流程分支只依据用户确认和 pytest 真实退出码。
+管理“任务拆分 → 代码实现 → 测试编写 → 宿主 pytest”的状态迁移。失败时图会回到
+`implement_code` 节点最多循环两次，不会重新执行 `write_tests`；流程分支只依据用户确认和 pytest 真实退出码。
 
 先安装示例依赖：
 

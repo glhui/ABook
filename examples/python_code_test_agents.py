@@ -24,7 +24,7 @@ SOURCE_DIRECTORY: Final[Path] = ROOT_DIRECTORY / "src"
 RUNS_DIRECTORY: Final[Path] = ROOT_DIRECTORY / "tmp" / "runs"
 OUTPUT_DIRECTORY: Final[Path] = ROOT_DIRECTORY / "tmp" / "output"
 MAX_LOG_CHARACTERS: Final[int] = 4_000
-MAX_REPAIR_ATTEMPTS: Final[int] = 2
+MAX_VALIDATION_RETRIES: Final[int] = 2
 LOG_SEPARATOR_WIDTH: Final[int] = 56
 ANSI_RESET: Final[str] = "\033[0m"
 ANSI_BLUE: Final[str] = "\033[34m"
@@ -219,7 +219,7 @@ def run_pytest(root_directory: Path, test_file: Path) -> subprocess.CompletedPro
 
 
 # 构造只允许修复生产代码的失败诊断，防止 Agent 通过修改测试规避问题。
-def create_repair_prompt(
+def create_code_retry_prompt(
     isolated_run: IsolatedRun,
     source_file: str,
     test_file: str,
@@ -233,8 +233,11 @@ def create_repair_prompt(
         f"`{isolated_run.source_file}`。\n源码文件：{source_file}\n测试文件：{test_file}\n"
         f"核心函数：{core_function}\n行为要求：{requirements}\n"
         f"pytest 输出：\n{bounded_log(pytest_output)}\n"
-        "根据失败信息修复实现；不要读取或修改测试文件，不要削弱测试断言。"
-        "修改后可使用 bash 对源码运行 `python -m py_compile`；最终 pytest 验证由宿主执行。"
+        "这是代码编写节点的下一轮，不是独立的修复角色。根据失败信息修改实现；"
+        "不要读取或修改测试文件，不要削弱测试断言。"
+        f"必须使用 bash 运行 `python -m py_compile {source_file}`，不要使用 `cd` 或 `&&`；"
+        "只有编译通过后才能结束本轮；"
+        "最终 pytest 验证由宿主执行。"
     )
 
 
@@ -273,7 +276,7 @@ async def run_workflow(problem: str, skill_catalog: SkillCatalog | None = None) 
         print_log_block("Skill 路由", "选择结果", selection_summary, ANSI_MAGENTA)
     skill_instructions = render_skill_instructions(selected_skills)
     print_log_block("工作流", "1/4 任务拆分", "核心函数和文件已确定。", ANSI_GREEN)
-    confirmation = input("允许 Agent 在隔离目录中修改文件，并让代码 Agent 编译源码吗？[y/N] ").strip().lower()
+    confirmation = input("允许 Agent 在隔离目录中修改文件，并让代码和测试 Agent 编译各自文件吗？[y/N] ").strip().lower()
     if confirmation != "y":
         print_log_block("工作流", "已取消", "未取得确认，流程结束。", ANSI_YELLOW)
         return False
@@ -291,7 +294,7 @@ async def run_workflow(problem: str, skill_catalog: SkillCatalog | None = None) 
             test_agent = create_python_test_agent(
                 model,
                 executor,
-                create_file_only_context("python-test", "write-pytest-tests"),
+                create_file_only_context("python-test", "write-pytest-tests", allow_bash=True),
             )
             code_agent = create_python_code_agent(
                 model,
@@ -306,12 +309,16 @@ async def run_workflow(problem: str, skill_catalog: SkillCatalog | None = None) 
                 f"源码文件：{allocation.source_file}\n核心函数：{allocation.core_function}\n"
                 f"行为要求：{allocation.requirements}\n"
                 "使用 pytest 编写正常、边界和错误场景测试；不要读取或修改源码文件。"
+                f"必须使用 bash 运行 `python -m py_compile {allocation.test_file}`，不要使用 `cd` 或 `&&`；"
+                "只有编译通过后才能结束本轮。"
             )
             code_prompt = (
                 f"项目目录是 `{isolated_run.root_directory}`。只读取 AGENTS.md，并只修改 `{isolated_run.source_file}`。\n"
                 f"源码文件：{allocation.source_file}\n测试文件：{allocation.test_file}\n"
                 f"核心函数：{allocation.core_function}\n行为要求：{allocation.requirements}\n"
-                "实现核心函数；不要读取或修改测试文件。修改后可使用 bash 对源码运行 `python -m py_compile`。"
+                "实现核心函数；不要读取或修改测试文件。"
+                f"必须使用 bash 运行 `python -m py_compile {allocation.source_file}`，不要使用 `cd` 或 `&&`；"
+                "只有编译通过后才能结束本轮。"
                 "最终 pytest 测试由宿主执行。"
             )
 
@@ -323,33 +330,33 @@ async def run_workflow(problem: str, skill_catalog: SkillCatalog | None = None) 
                     on_response=test_logger.on_response,
                     on_event=test_logger.on_event,
                 )
-                print_log_block("工作流", "3/4 测试 Agent", "已完成 pytest 测试。", ANSI_GREEN)
+                print_log_block("工作流", "3/4 测试 Agent", "测试文件已编译通过。", ANSI_GREEN)
 
-            async def generate_code() -> None:
-                print_log_block("工作流", "3/4 代码 Agent", "已启动。", ANSI_CYAN)
+            async def generate_code(code_authoring_prompt: str, event: str) -> None:
+                print_log_block("工作流", event, "已启动。", ANSI_CYAN)
                 await run_observed(
                     code_agent,
-                    code_prompt,
+                    code_authoring_prompt,
                     on_response=code_logger.on_response,
                     on_event=code_logger.on_event,
                 )
-                print_log_block("工作流", "3/4 代码 Agent", "已完成核心函数。", ANSI_GREEN)
+                print_log_block("工作流", event, "源码已编译通过。", ANSI_GREEN)
 
             # 代码先完成，避免两个 Agent 同时写日志；测试 Agent 随后仅依据需求验证公开行为。
-            await generate_code()
+            await generate_code(code_prompt, "3/4 代码 Agent")
             await generate_tests()
             print_log_block("工作流", "4/4 pytest", "正在运行 pytest。", ANSI_CYAN)
             completed = run_pytest(isolated_run.root_directory, isolated_run.test_file)
-            for repair_attempt in range(1, MAX_REPAIR_ATTEMPTS + 1):
+            for retry_attempt in range(1, MAX_VALIDATION_RETRIES + 1):
                 if completed.returncode == 0:
                     return True
                 print_log_block(
                     "工作流",
-                    "4/4 修复",
-                    f"pytest 未通过，正在进行第 {repair_attempt} 次修复。",
+                    "回到代码编写",
+                    f"pytest 未通过，代码 Agent 正在进行第 {retry_attempt} 次重新编写；测试 Agent 不会再次运行。",
                     ANSI_YELLOW,
                 )
-                repair_prompt = create_repair_prompt(
+                retry_prompt = create_code_retry_prompt(
                     isolated_run,
                     allocation.source_file,
                     allocation.test_file,
@@ -357,12 +364,7 @@ async def run_workflow(problem: str, skill_catalog: SkillCatalog | None = None) 
                     allocation.requirements,
                     completed.stdout + completed.stderr,
                 )
-                await run_observed(
-                    code_agent,
-                    repair_prompt,
-                    on_response=code_logger.on_response,
-                    on_event=code_logger.on_event,
-                )
+                await generate_code(retry_prompt, f"3/4 代码 Agent（第 {retry_attempt} 次回退）")
                 print_log_block("工作流", "4/4 pytest", "正在重新运行 pytest。", ANSI_CYAN)
                 completed = run_pytest(isolated_run.root_directory, isolated_run.test_file)
             return completed.returncode == 0

@@ -1,6 +1,7 @@
 """提供不含授权策略的 Bash 命令执行能力。"""
 
 from dataclasses import dataclass
+import locale
 import os
 from pathlib import Path
 import subprocess
@@ -36,7 +37,7 @@ class LocalBashRunner:
                 cwd=working_directory,
                 capture_output=True,
                 check=False,
-                encoding="utf-8",
+                encoding=self._output_encoding(),
                 errors="replace",
                 text=True,
                 timeout=timeout_seconds,
@@ -64,15 +65,31 @@ class LocalBashRunner:
         if self._executable is not None:
             return [self._executable, "-lc", command]
         if os.name == "nt":
-            return ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command]
+            return [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                self._normalize_windows_command(command),
+            ]
         return ["bash", "-lc", command]
+
+    # 将模型常用的 Bash 串联符转换为 Windows PowerShell 5.1 可解析的顺序命令。
+    def _normalize_windows_command(self: "LocalBashRunner", command: str) -> str:
+        return command.replace("&&", ";")
+
+    # PowerShell 5.1 的宿主错误遵循 Windows 代码页，不能固定按 UTF-8 解码。
+    def _output_encoding(self: "LocalBashRunner") -> str:
+        if self._executable is not None or os.name != "nt":
+            return "utf-8"
+        return locale.getpreferredencoding(False)
 
     # 将 TimeoutExpired 在不同 Python 配置下返回的字节或文本统一为文本。
     def _as_text(self: "LocalBashRunner", value: str | bytes | None) -> str:
         if value is None:
             return ""
         if isinstance(value, bytes):
-            return value.decode("utf-8", errors="replace")
+            return value.decode(self._output_encoding(), errors="replace")
         return value
 
 

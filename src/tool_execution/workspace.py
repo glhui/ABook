@@ -25,7 +25,7 @@ WorkspaceFilePath = Annotated[
 StartLine = Annotated[int, Field(description="从 1 开始的首行行号。")]
 EndLine = Annotated[int | None, Field(description="从 1 开始的末行行号，省略时读取至文件末尾。")]
 ExpectedReplacements = Annotated[int, Field(description="旧文本必须出现的次数。")]
-BashCommand = Annotated[str, Field(description="在受控工作区根目录中执行的完整 Bash 命令。")]
+BashCommand = Annotated[str, Field(description="在受控工作区根目录中执行的完整平台 Shell 命令。")]
 TimeoutSeconds = Annotated[float | None, Field(description="命令超时秒数；省略时由 Bash 后端决定。")]
 
 
@@ -123,7 +123,7 @@ class WorkspaceToolExecutor:
         self._record(context, "replace_text", target_path, allowed=True, reason=None)
         return result
 
-    # 在取得显式用户确认后运行 Bash；任意 Shell 命令不能仅凭能力标签自动放行。
+    # 在取得显式用户确认后运行平台 Shell；任意命令不能仅凭能力标签自动放行。
     def run_bash(
         self: "WorkspaceToolExecutor",
         context: ToolExecutionContext,
@@ -267,7 +267,7 @@ class AuthorizedWorkspaceTools:
         except ToolExecutionDenied as error:
             raise ModelRetry(str(error)) from error
 
-    # 在本轮固定的调用上下文中执行经确认的 Bash 命令。
+    # 在本轮固定的调用上下文中执行经确认的平台 Shell 命令。
     def run_bash(
         self: "AuthorizedWorkspaceTools",
         command: BashCommand,
@@ -308,7 +308,8 @@ class AuthorizedWorkspaceTools:
                     name="bash",
                     description=(
                         "在受控工作区根目录执行平台 Shell 命令；Unix 使用 Bash，Windows 使用 PowerShell。"
-                        "每次执行都必须已经获得用户确认。"
+                        "Windows 上使用 PowerShell 语法，编译可直接运行 `python -m py_compile src/module.py`，"
+                        "不要使用 Bash 专用的 `&&` 或 `cd`。每次执行都必须已经获得用户确认。"
                     ),
                 )
             )
