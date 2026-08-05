@@ -1,0 +1,11 @@
+{
+  "name": "python-core-function",
+  "version": "1.0.0",
+  "kind": "repository",
+  "description": "在当前示例的 src/ 目录中实现单一、可测试的 Python 核心函数。",
+  "roles": ["python_code"],
+  "triggers": ["函数", "实现", "编写", "代码"],
+  "path_patterns": ["src/**/*.py"],
+  "priority": 90,
+  "estimated_tokens": 350
+}

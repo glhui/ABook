@@ -62,6 +62,20 @@ class PythonCodeAgentProfileTests(unittest.TestCase):
             self.assertEqual(agent.model_settings.get("max_tokens"), 8_192)
             self.assertTrue(any("Python 代码 Agent 工作说明" in instruction for instruction in agent._instructions))
 
+    # 代码 Agent 应把路由器选中的 Skill 放在固定角色说明之后。
+    def test_create_code_agent_appends_selected_skill_instructions(self: "PythonCodeAgentProfileTests") -> None:
+        with TemporaryDirectory() as temporary_directory:
+            executor = self._create_executor(Path(temporary_directory))
+
+            agent = create_python_code_agent(
+                TestModel(),
+                executor,
+                create_python_code_context("task-with-skill"),
+                skill_instructions="## Skill: example\n\n只用于当前任务。",
+            )
+
+            self.assertTrue(any("Skill: example" in instruction for instruction in agent._instructions))
+
     def test_create_agent_rejects_identity_outside_fixed_profile(self: "PythonCodeAgentProfileTests") -> None:
         with TemporaryDirectory() as temporary_directory:
             executor = self._create_executor(Path(temporary_directory))

@@ -14,6 +14,21 @@
 .\.venv\Scripts\python.exe examples\python_code_test_agents.py
 ```
 
+## 按需 Skill 的代码编写流程
+
+`skill_aware_python_code_agents.py` 复用上面的“任务拆分 → 代码 Agent → 测试 Agent →
+宿主 pytest → 有界修复”流程。启动时只发现 `examples/skill_catalog/` 中的 manifest；
+协调器给出源码路径和核心函数后，路由器才根据角色、目标路径、任务关键词和符号选择
+最多三个 Skill，并只读取最终选中的 `SKILL.md`。示例 catalog 包含通用核心函数 Skill
+和仅在日期、时间任务中命中的 `datetime` Skill。
+
+依赖与现有多 Agent 示例相同，需要在 `.env` 中设置 `ABOOK_API_KEY`，可选设置
+`ABOOK_MODEL` 和 `ABOOK_BASE_URL`。从项目根目录运行：
+
+```powershell
+.\.venv\Scripts\python.exe examples\skill_aware_python_code_agents.py
+```
+
 在项目根目录运行：
 
 ```powershell

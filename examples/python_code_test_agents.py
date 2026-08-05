@@ -38,6 +38,7 @@ if str(SOURCE_DIRECTORY) not in sys.path:
 
 from agent_profiles import create_code_test_task_coordinator, create_python_code_agent, create_python_test_agent
 from agent_runtime import run_observed
+from skill_loading import SkillCatalog, SkillSelector, SkillTaskContext, render_skill_instructions
 from tool_execution import (
     InMemoryToolAuditLog,
     ToolApproval,
@@ -238,7 +239,7 @@ def create_repair_prompt(
 
 
 # 按顺序编写核心函数和 pytest 测试，再由宿主运行 pytest。
-async def run_workflow(problem: str) -> bool:
+async def run_workflow(problem: str, skill_catalog: SkillCatalog | None = None) -> bool:
     model = create_model()
     print_log_block("工作流", "1/4 任务拆分", "正在确定核心函数和文件……", ANSI_CYAN)
     coordinator = create_code_test_task_coordinator(model)
@@ -256,6 +257,21 @@ async def run_workflow(problem: str) -> bool:
         json.dumps(allocation.model_dump(), ensure_ascii=False),
         ANSI_MAGENTA,
     )
+    selected_skills = ()
+    if skill_catalog is not None:
+        selected_skills = SkillSelector(skill_catalog).select(
+            SkillTaskContext(
+                task=f"{problem}\n{allocation.requirements}",
+                role="python_code",
+                target_paths=(allocation.source_file,),
+                symbols=(allocation.core_function,),
+            )
+        )
+        selection_summary = "\n".join(
+            f"- {skill.name}: {'；'.join(skill.reasons)}" for skill in selected_skills
+        ) or "未找到相关 Skill，继续使用固定角色说明。"
+        print_log_block("Skill 路由", "选择结果", selection_summary, ANSI_MAGENTA)
+    skill_instructions = render_skill_instructions(selected_skills)
     print_log_block("工作流", "1/4 任务拆分", "核心函数和文件已确定。", ANSI_GREEN)
     confirmation = input("允许 Agent 在隔离目录中修改文件，并让代码 Agent 编译源码吗？[y/N] ").strip().lower()
     if confirmation != "y":
@@ -281,6 +297,7 @@ async def run_workflow(problem: str) -> bool:
                 model,
                 executor,
                 create_file_only_context("python-code", "implement-core-function", allow_bash=True),
+                skill_instructions=skill_instructions,
             )
             test_logger = AgentRunLogger("测试 Agent")
             code_logger = AgentRunLogger("代码 Agent")

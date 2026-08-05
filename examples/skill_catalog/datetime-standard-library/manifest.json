@@ -1,0 +1,12 @@
+{
+  "name": "datetime-standard-library",
+  "version": "1.0.0",
+  "kind": "package",
+  "description": "使用 Python datetime 标准库处理日期、时间、时区和 ISO 8601 数据。",
+  "roles": ["python_code"],
+  "triggers": ["日期", "时间", "时区", "datetime", "ISO 8601"],
+  "import_names": ["datetime"],
+  "symbols": ["date", "datetime", "timedelta", "timezone"],
+  "priority": 80,
+  "estimated_tokens": 400
+}

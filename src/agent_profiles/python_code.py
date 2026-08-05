@@ -59,12 +59,16 @@ def create_python_code_agent(
     model: Model,
     executor: WorkspaceToolExecutor,
     context: ToolExecutionContext,
+    skill_instructions: str | None = None,
 ) -> Agent[None, str]:
     _validate_context(context)
     authorized_tools = AuthorizedWorkspaceTools(executor, context)
+    instructions = f"{PYTHON_CODE_INSTRUCTIONS}\n\n{load_role_instructions('python_code')}"
+    if skill_instructions:
+        instructions = f"{instructions}\n\n{skill_instructions}"
     return Agent(
         model,
-        instructions=f"{PYTHON_CODE_INSTRUCTIONS}\n\n{load_role_instructions('python_code')}",
+        instructions=instructions,
         model_settings=create_agent_model_settings(),
         tools=authorized_tools.as_pydantic_tools(),
     )
