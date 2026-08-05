@@ -21,7 +21,7 @@ from tool_execution import (
 @dataclass(frozen=True)
 class AgentProfile:
     agent_id: str
-    role: RoleInstructionName
+    role: RoleInstructionName # 标明一个agent，和prompt无关
     capabilities: frozenset[ToolCapability]
     approvals: frozenset[ToolApproval]
     base_instructions: str

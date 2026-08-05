@@ -1,0 +1,12 @@
+{
+  "name": "numpy",
+  "version": "1.0.0",
+  "kind": "package",
+  "description": "使用 NumPy 实现数组、向量、矩阵与数值计算功能。",
+  "roles": ["python_code"],
+  "triggers": ["numpy", "数组", "向量", "矩阵", "ndarray", "线性代数"],
+  "import_names": ["numpy"],
+  "symbols": ["array", "ndarray", "dot", "matmul", "linalg"],
+  "priority": 80,
+  "estimated_tokens": 450
+}

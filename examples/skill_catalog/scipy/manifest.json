@@ -1,0 +1,13 @@
+{
+  "name": "scipy",
+  "version": "1.0.0",
+  "kind": "package",
+  "description": "使用 SciPy 完成优化、积分、插值与科学统计计算。",
+  "roles": ["python_code"],
+  "triggers": ["scipy", "优化", "积分", "插值", "统计分布", "最小化"],
+  "import_names": ["scipy"],
+  "symbols": ["minimize", "quad", "interp1d", "stats"],
+  "depends_on": ["numpy"],
+  "priority": 85,
+  "estimated_tokens": 500
+}

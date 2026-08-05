@@ -1,4 +1,4 @@
-"""使用 LangGraph 编排代码、测试、验证和修复 Agent 的示例。"""
+"""使用 LangGraph 编排代码、测试和有界回退的示例。"""
 
 import asyncio
 from collections.abc import Callable
@@ -15,6 +15,7 @@ from pydantic_ai.models import Model
 from pydantic_ai.models.openai import OpenAIChatModel
 
 ROOT_DIRECTORY: Final[Path] = Path(__file__).resolve().parents[1]
+SKILL_CATALOG_DIRECTORY: Final[Path] = ROOT_DIRECTORY / "examples" / "skill_catalog"
 if str(ROOT_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(ROOT_DIRECTORY))
 
@@ -44,6 +45,7 @@ from examples.python_code_test_agents import (
     publish_submission,
     run_pytest,
 )
+from skill_loading import SelectedSkill, SkillCatalog, SkillSelector, SkillTaskContext, render_skill_instructions
 
 
 # 保存图节点之间传递的最小业务状态；模型和 Agent 实例保留在节点闭包中，不写入状态。
@@ -53,6 +55,7 @@ class CodeTestWorkflowState(TypedDict, total=False):
     approved: bool
     isolated_run: IsolatedRun
     validation_result: subprocess.CompletedProcess[str]
+    skill_instructions: str
     repair_attempt: int
     workflow_succeeded: bool
 
@@ -65,6 +68,7 @@ def create_code_test_workflow(
     model: Model,
     run_directory: Path,
     confirm: Callable[[], bool],
+    skill_catalog: SkillCatalog | None = None,
 ) -> CompiledStateGraph[CodeTestWorkflowState, None, CodeTestWorkflowState, CodeTestWorkflowState]:
     graph = StateGraph(CodeTestWorkflowState)
     coordinator_logger = AgentRunLogger("协调 Agent", show_model_text=False)
@@ -87,7 +91,18 @@ def create_code_test_workflow(
             allocation.model_dump_json(indent=2),
             ANSI_MAGENTA,
         )
-        return {"allocation": allocation, "approved": confirm(), "repair_attempt": 0}
+        selected_skills = select_code_skills(skill_catalog, allocation, state["problem"])
+        skill_instructions = render_skill_instructions(selected_skills)
+        selection_summary = "\n".join(
+            f"- {skill.name}: {'；'.join(skill.reasons)}" for skill in selected_skills
+        ) or "未命中相关 Skill，继续使用固定角色说明。"
+        print_log_block("Skill 路由", "选择结果", selection_summary, ANSI_MAGENTA)
+        return {
+            "allocation": allocation,
+            "approved": confirm(),
+            "repair_attempt": 0,
+            "skill_instructions": skill_instructions,
+        }
 
     # 在确认后建立隔离项目，确保后续所有节点共享同一份源码与测试文件。
     def prepare_workspace(state: CodeTestWorkflowState) -> CodeTestWorkflowState:
@@ -104,6 +119,7 @@ def create_code_test_workflow(
             model,
             create_isolated_executor(isolated_run.root_directory),
             create_file_only_context("python-code", "implement-core-function", allow_bash=True),
+            skill_instructions=state["skill_instructions"] or None,
         )
         retry_attempt = state["repair_attempt"]
         if "validation_result" in state:
@@ -162,29 +178,6 @@ def create_code_test_workflow(
         print_log_block("工作流", "4/4 pytest", "正在运行 pytest。", ANSI_CYAN)
         return {"validation_result": run_pytest(isolated_run.root_directory, isolated_run.test_file)}
 
-    # 修复节点只把实际 pytest 诊断提供给代码 Agent，随后回到验证节点形成有界循环。
-    async def repair(state: CodeTestWorkflowState) -> CodeTestWorkflowState:
-        allocation = state["allocation"]
-        isolated_run = state["isolated_run"]
-        attempt = state["repair_attempt"] + 1
-        validation_result = state["validation_result"]
-        print_log_block("工作流", "4/4 修复", f"pytest 未通过，正在进行第 {attempt} 次修复。", ANSI_YELLOW)
-        code_agent = create_python_code_agent(
-            model,
-            create_isolated_executor(isolated_run.root_directory),
-            create_file_only_context("python-code", "repair-core-function", allow_bash=True),
-        )
-        prompt = create_repair_prompt(
-            isolated_run,
-            allocation.source_file,
-            allocation.test_file,
-            allocation.core_function,
-            allocation.requirements,
-            validation_result.stdout + validation_result.stderr,
-        )
-        await run_observed(code_agent, prompt, on_response=code_logger.on_response, on_event=code_logger.on_event)
-        return {"repair_attempt": attempt}
-
     # 将终止节点与正常失败区别开，调用方只需要读取一个明确的布尔结果。
     def finish(state: CodeTestWorkflowState) -> CodeTestWorkflowState:
         passed = state["validation_result"].returncode == 0
@@ -227,6 +220,24 @@ def create_code_test_workflow(
     return graph.compile()
 
 
+# 仅用协调结果中的稳定任务信号选择代码 Skill，避免读取尚未生成的源码或全量加载正文。
+def select_code_skills(
+    skill_catalog: SkillCatalog | None,
+    allocation: CodeTestTaskAllocation,
+    problem: str,
+) -> tuple[SelectedSkill, ...]:
+    if skill_catalog is None:
+        return ()
+    return SkillSelector(skill_catalog).select(
+        SkillTaskContext(
+            task=f"{problem}\n{allocation.requirements}",
+            role="python_code",
+            target_paths=(allocation.source_file,),
+            symbols=(allocation.core_function,),
+        )
+    )
+
+
 # 保持原示例的命令行交互和临时目录清理行为，仅将步骤推进委托给 LangGraph。
 async def run_workflow(problem: str) -> bool:
     model: OpenAIChatModel = create_model()
@@ -238,7 +249,8 @@ async def run_workflow(problem: str) -> bool:
         return answer.strip().lower() == "y"
 
     with TemporaryDirectory(prefix="langgraph-run-", dir=RUNS_DIRECTORY) as temporary_directory:
-        workflow = create_code_test_workflow(model, Path(temporary_directory), confirm)
+        skill_catalog = SkillCatalog.discover(SKILL_CATALOG_DIRECTORY)
+        workflow = create_code_test_workflow(model, Path(temporary_directory), confirm, skill_catalog)
         result = cast(CodeTestWorkflowState, await workflow.ainvoke({"problem": problem}))
         isolated_run = result.get("isolated_run")
         if isolated_run is not None:

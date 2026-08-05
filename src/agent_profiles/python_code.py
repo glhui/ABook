@@ -1,19 +1,11 @@
 """创建具备固定开发规范的 Python 代码 Agent。"""
 
-from typing import Final
-
 from pydantic_ai import Agent
 from pydantic_ai.models import Model
 
 from agent_profiles.model_settings import AgentModelConfig
 from agent_profiles.profiles import PYTHON_CODE_PROFILE, create_profile_agent, create_profile_context
-from tool_execution import ToolApproval, ToolCapability, ToolExecutionContext, WorkspaceToolExecutor
-
-
-PYTHON_CODE_AGENT_ID: Final[str] = PYTHON_CODE_PROFILE.agent_id
-PYTHON_CODE_CAPABILITIES: Final[frozenset[ToolCapability]] = PYTHON_CODE_PROFILE.capabilities
-PYTHON_CODE_APPROVALS: Final[frozenset[ToolApproval]] = PYTHON_CODE_PROFILE.approvals
-PYTHON_CODE_INSTRUCTIONS: Final[str] = PYTHON_CODE_PROFILE.base_instructions
+from tool_execution import ToolApproval, ToolExecutionContext, WorkspaceToolExecutor
 
 
 # 为 Python 代码任务创建固定角色的最小授权上下文，用户确认由调用方显式传入。

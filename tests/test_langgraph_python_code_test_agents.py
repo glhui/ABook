@@ -6,7 +6,13 @@ import unittest
 
 from pydantic_ai.models.test import TestModel
 
-from examples.langgraph_python_code_test_agents import create_code_test_workflow
+from agent_profiles import CodeTestTaskAllocation
+from examples.langgraph_python_code_test_agents import (
+    SKILL_CATALOG_DIRECTORY,
+    create_code_test_workflow,
+    select_code_skills,
+)
+from skill_loading import SkillCatalog
 
 
 # 验证迁移后的图保留代码、测试、验证和回到代码节点的有界循环。
@@ -30,3 +36,21 @@ class LangGraphCodeTestWorkflowTests(unittest.TestCase):
         )
         self.assertIn(("validate", "implement_code"), edges)
         self.assertNotIn("repair", node_names)
+
+    # LangGraph 在协调结果确定后按需求选择 Skill，并只为代码 Agent 准备注入内容。
+    def test_select_code_skills_loads_scipy_and_its_numpy_dependency(self: "LangGraphCodeTestWorkflowTests") -> None:
+        allocation = CodeTestTaskAllocation(
+            source_file="src/optimizer.py",
+            core_function="minimize_loss(values: list[float]) -> float",
+            test_file="tests/test_optimizer.py",
+            requirements="使用 SciPy 优化求解最小值，并验证收敛失败路径。",
+        )
+
+        selected = select_code_skills(
+            SkillCatalog.discover(SKILL_CATALOG_DIRECTORY),
+            allocation,
+            "实现一个 scipy 最小化函数。",
+        )
+
+        self.assertEqual([skill.name for skill in selected], ["python-core-function", "numpy", "scipy"])
+        self.assertTrue(all(skill.content for skill in selected))

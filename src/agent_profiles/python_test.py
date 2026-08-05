@@ -1,19 +1,11 @@
 """创建具备固定测试规范的 Python 测试编写 Agent。"""
 
-from typing import Final
-
 from pydantic_ai import Agent
 from pydantic_ai.models import Model
 
 from agent_profiles.model_settings import AgentModelConfig
 from agent_profiles.profiles import PYTHON_TEST_PROFILE, create_profile_agent, create_profile_context
-from tool_execution import ToolApproval, ToolCapability, ToolExecutionContext, WorkspaceToolExecutor
-
-
-PYTHON_TEST_AGENT_ID: Final[str] = PYTHON_TEST_PROFILE.agent_id
-PYTHON_TEST_CAPABILITIES: Final[frozenset[ToolCapability]] = PYTHON_TEST_PROFILE.capabilities
-PYTHON_TEST_APPROVALS: Final[frozenset[ToolApproval]] = PYTHON_TEST_PROFILE.approvals
-PYTHON_TEST_INSTRUCTIONS: Final[str] = PYTHON_TEST_PROFILE.base_instructions
+from tool_execution import ToolApproval, ToolExecutionContext, WorkspaceToolExecutor
 
 
 # 为 Python 测试任务创建固定角色的最小授权上下文，用户确认由调用方显式传入。

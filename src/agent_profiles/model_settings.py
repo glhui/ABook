@@ -12,8 +12,8 @@ AGENT_MAX_OUTPUT_TOKENS: Final[int] = 8_192
 # 表示角色默认值或调用方覆盖值，避免模型参数分散在各个 Agent 工厂中。
 @dataclass(frozen=True)
 class AgentModelConfig:
-    max_output_tokens: int = AGENT_MAX_OUTPUT_TOKENS
-    temperature: float | None = None
+    max_output_tokens: int = AGENT_MAX_OUTPUT_TOKENS # 最大输出token
+    temperature: float | None = None # 温度参数，控制输出的随机性，范围为0到2，默认值为None表示使用模型默认值。
 
     # 在构建底层可变映射前校验配置，尽早报告无效角色或调用方参数。
     def __post_init__(self: "AgentModelConfig") -> None:

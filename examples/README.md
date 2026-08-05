@@ -6,45 +6,6 @@
 
 可复用的轮次执行逻辑位于 `src/agent_runtime/run_turn.py`。调用方可通过 `on_response` 处理完整模型响应，通过 `on_event` 处理所有工具事件；后续增加事件展示逻辑时，无需复制 Agent 迭代和工具执行代码。
 
-## 测试先行的多 Agent 协作
-
-`python_code_test_agents.py` 演示三个预定义角色的手动协作：协调 Agent 先将需求拆为测试任务和编码任务；两个工作包可以并行，但示例刻意让代码 Agent 先完成生产代码、测试 Agent 再完成 `tests/`，因此日志按角色顺序输出。两者都必须在自己的节点使用 Bash 执行 `python -m py_compile`，确认各自文件可编译；pytest 仍由宿主统一执行。若 pytest 失败，工作流只回到代码编写节点，并最多重新编写两次生产代码，测试 Agent 不会再次运行或修改测试。三个 Agent 只可访问项目根目录的 `tmp/` 共享隔离区，目录已被 Git 忽略，不会污染项目源码；示例会在文件修改和本地测试命令执行前请求一次显式确认。
-
-```powershell
-.\.venv\Scripts\python.exe examples\python_code_test_agents.py
-```
-
-## Agent Profile 配置
-
-`agent_profile_configuration.py` 是不需要网络或真实密钥的离线示例。它展示如何读取角色说明注册信息、创建代码 Agent 的固定上下文，以及在单次创建时用 `AgentModelConfig` 覆盖 `max_output_tokens` 和 `temperature`。
-
-```powershell
-.\.venv\Scripts\python.exe examples\agent_profile_configuration.py
-```
-
-## Profile 驱动的代码与测试案例
-
-`profile_code_test_case.py` 是可重复的离线闭环：代码角色上下文创建 `normalize_words` 模块，测试角色上下文创建 pytest 用例，宿主再运行真实 pytest。该示例不调用模型，因此适合验证角色 Profile、工作区工具和测试执行基础设施的协作方式。
-
-```powershell
-.\.venv\Scripts\python.exe examples\profile_code_test_case.py
-```
-
-## 按需 Skill 的代码编写流程
-
-`skill_aware_python_code_agents.py` 复用上面的“任务拆分 → 代码 Agent → 测试 Agent →
-宿主 pytest → 回到代码编写节点的有界重试”流程。启动时只发现 `examples/skill_catalog/` 中的 manifest；
-协调器给出源码路径和核心函数后，路由器才根据角色、目标路径、任务关键词和符号选择
-最多三个 Skill，并只读取最终选中的 `SKILL.md`。示例 catalog 包含通用核心函数 Skill
-和仅在日期、时间任务中命中的 `datetime` Skill。
-
-依赖与现有多 Agent 示例相同，需要在 `.env` 中设置 `ABOOK_API_KEY`，可选设置
-`ABOOK_MODEL` 和 `ABOOK_BASE_URL`。从项目根目录运行：
-
-```powershell
-.\.venv\Scripts\python.exe examples\skill_aware_python_code_agents.py
-```
-
 在项目根目录运行：
 
 ```powershell
@@ -53,10 +14,20 @@
 
 可尝试输入：`现在几点？`、`请计算 (18 + 6) * 3`、`列出当前工作区的文件` 或 `查看 Git 状态`。工具在 Unix 使用 Bash，在 Windows 使用 PowerShell。输入 `/quit` 退出。
 
-## LangGraph 编排的代码—测试—验证—修复
+## 测试先行的多 Agent 协作
 
-`langgraph_python_code_test_agents.py` 复用原有的协调、代码和测试 Agent，仅用 LangGraph
-管理“任务拆分 → 代码实现 → 测试编写 → 宿主 pytest”的状态迁移。失败时图会回到
+`python_code_test_agents.py` 演示三个预定义角色的手动协作：协调 Agent 先将需求拆为测试任务和编码任务；两个工作包可以并行，但示例刻意让代码 Agent 先完成生产代码、测试 Agent 再完成 `tests/`，因此日志按角色顺序输出。两者都必须在自己的节点使用 Bash 执行 `python -m py_compile`，确认各自文件可编译；pytest 仍由宿主统一执行。若 pytest 失败，工作流只回到代码编写节点，并最多重新编写两次生产代码，测试 Agent 不会再次运行或修改测试。三个 Agent 只可访问项目根目录的 `tmp/` 共享隔离区，目录已被 Git 忽略，不会污染项目源码；示例会在文件修改和本地测试命令执行前请求一次显式确认。
+
+```powershell
+.\.venv\Scripts\python.exe examples\python_code_test_agents.py
+```
+
+## LangGraph 编排的代码—测试与 Skill 路由
+
+`langgraph_python_code_test_agents.py` 复用原有的协调、代码和测试 Agent，并用 LangGraph
+管理“任务拆分 → Skill 路由 → 代码实现 → 测试编写 → 宿主 pytest”的状态迁移。协调器确定
+源码路径、核心函数和需求后，工作流才从 `examples/skill_catalog/` 选择最多三个匹配的 Skill，
+仅向代码 Agent 注入其正文；catalog 包含通用 Python、datetime、NumPy 和 SciPy Skill。失败时图会回到
 `implement_code` 节点最多循环两次，不会重新执行 `write_tests`；流程分支只依据用户确认和 pytest 真实退出码。
 
 先安装示例依赖：
