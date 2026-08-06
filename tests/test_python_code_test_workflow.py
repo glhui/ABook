@@ -7,7 +7,8 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai import FunctionToolCallEvent, FunctionToolResultEvent
+from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 
 from examples.python_code_test_agents import (
     AgentRunLogger,
@@ -79,8 +80,37 @@ class AgentRunLoggerTests(unittest.TestCase):
             logger.on_response(ModelResponse(parts=[TextPart(content='{"properties": {}}')]))
 
         log = output.getvalue()
-        self.assertIn("等待结构化校验", log)
+        self.assertEqual(log, "")
         self.assertNotIn('"properties"', log)
+
+    def test_structured_result_uses_same_model_round(self: "AgentRunLoggerTests") -> None:
+        output = StringIO()
+        logger = AgentRunLogger("协调 Agent", show_model_text=False)
+
+        with redirect_stdout(output):
+            logger.on_response(ModelResponse(parts=[TextPart(content="hidden")]))
+            logger.log_structured_result('{"source_file": "src/example.py"}')
+
+        log = output.getvalue()
+        self.assertIn("[协调 Agent][模型轮次 1]", log)
+        self.assertIn("source_file", log)
+        self.assertNotIn("结构化结果", log)
+
+    def test_tool_call_and_result_are_combined(self: "AgentRunLoggerTests") -> None:
+        output = StringIO()
+        logger = AgentRunLogger("代码 Agent")
+        call = FunctionToolCallEvent(part=ToolCallPart(tool_name="read_file", args={"path": "AGENTS.md"}))
+        result = FunctionToolResultEvent(part=ToolReturnPart(tool_name="read_file", content="ok"))
+
+        with redirect_stdout(output):
+            logger.on_event(call)
+            logger.on_event(result)
+
+        log = output.getvalue()
+        self.assertIn("[代码 Agent][工具：read_file · AGENTS.md]", log)
+        self.assertIn("参数：", log)
+        self.assertIn("结果：ok", log)
+        self.assertNotIn("工具开始", log)
 
 
 # 回退到代码编写的提示必须携带失败诊断，同时保持代码 Agent 对测试文件的隔离约束。

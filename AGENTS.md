@@ -1,5 +1,18 @@
 # Python 编码规范
 
+## 项目运行上下文
+
+- 本仓库是 Python Agent 组件与可运行示例的集合，不是单一的可安装应用；生产代码位于 `src/`，正式自动化测试位于 `tests/`。
+- `src/agent_profiles/` 定义固定 Agent 角色、模型参数与角色说明加载；`src/tool_execution/` 负责工作区工具的授权、策略、执行与审计；`src/skill_loading/` 负责 Skill catalog、选择和指令渲染；`src/agent_runtime/` 提供 PydanticAI 对话轮次执行辅助。
+- `examples/` 仅用于可运行演示，不得被 `src/` 导入。`references/` 是外部参考实现，只读；除非任务明确涉及，不修改、不将其视为本项目生产代码。`.abook/`、`.pytest_cache/`、`tmp/` 和 `__pycache__/` 为运行时或缓存内容，不修改也不纳入实现判断。
+- 需要模型连接的示例从仓库根目录 `.env` 读取 `ABOOK_MODEL`、`ABOOK_API_KEY` 与 `ABOOK_BASE_URL`。不得读取、输出或提交真实密钥；普通单元测试不得依赖这些配置或网络。
+
+## 验证入口
+
+- 在仓库根目录使用项目虚拟环境运行完整测试：`.\.venv\Scripts\python.exe -m unittest discover -s tests -v`。
+- 修改单个模块时，优先运行对应的 `tests/test_*.py`，再按改动范围运行完整测试。示例依赖（例如 LangGraph）是可选项，未安装时不要将其加入常规测试要求。
+- 运行示例的入口和额外依赖以 `examples/README.md` 为准；示例生成的临时文件只能写入已忽略的 `tmp/`。
+
 ## 类型与返回值
 
 - 所有函数、方法和异步函数必须为每个参数和返回值添加类型标注。

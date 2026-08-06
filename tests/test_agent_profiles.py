@@ -8,6 +8,7 @@ from pydantic_ai.models.test import TestModel
 
 from agent_profiles import (
     AgentModelConfig,
+    CodeTestTaskAllocation,
     create_code_test_task_coordinator,
     create_python_code_agent,
     create_python_code_context,
@@ -61,7 +62,7 @@ class PythonCodeAgentProfileTests(unittest.TestCase):
             agent = create_python_code_agent(TestModel(), executor, create_python_code_context("task-1"))
 
             self.assertEqual(set(agent._function_toolset.tools), {"read_file", "write_file", "replace_text"})
-            self.assertEqual(agent.model_settings.get("max_tokens"), 8_192)
+            self.assertEqual(agent.model_settings.get("max_tokens"), 384_000)
             self.assertTrue(any("Python 代码 Agent 工作说明" in instruction for instruction in agent._instructions))
 
     # 代码 Agent 应把路由器选中的 Skill 放在固定角色说明之后。
@@ -157,6 +158,32 @@ class PythonCodeAgentProfileTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "temperature"):
             AgentModelConfig(temperature=2.1)
         self.assertEqual(create_agent_model_settings(AgentModelConfig(max_output_tokens=123)).get("max_tokens"), 123)
+        with self.assertRaisesRegex(ValueError, "context_window_tokens"):
+            AgentModelConfig(context_window_tokens=0)
+
+    def test_task_plan_requires_visualization_path_when_enabled(self: "PythonCodeAgentProfileTests") -> None:
+        with self.assertRaises(ValueError):
+            CodeTestTaskAllocation(
+                source_file="src/math.py",
+                core_function="f(x: float) -> float",
+                test_file="tests/test_math.py",
+                requirements="绘制函数。",
+                needs_visualization=True,
+            )
+
+    def test_task_plan_accepts_visualization_path(self: "PythonCodeAgentProfileTests") -> None:
+        allocation = CodeTestTaskAllocation(
+            source_file="src/math.py",
+            core_function="f(x: float) -> float",
+            test_file="tests/test_math.py",
+            requirements="绘制函数。",
+            needs_visualization=True,
+            visualization_file="visualizations/plot.py",
+            validation_strategy="使用 pytest 和性质测试。",
+            human_checkpoints=("确认单位",),
+        )
+
+        self.assertEqual(allocation.visualization_file, "visualizations/plot.py")
 
     # 创建角色工厂测试所需的受控工作区执行器。
     def _create_executor(self: "PythonCodeAgentProfileTests", workspace_root: Path) -> WorkspaceToolExecutor:

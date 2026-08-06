@@ -19,6 +19,7 @@ if str(SOURCE_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SOURCE_DIRECTORY))
 
 from agent_runtime import run_turn
+from agent_profiles.model_settings import create_agent_model_settings
 from terminal import CYAN, GREEN, MAGENTA, RED, RESET, YELLOW
 from tool_execution import (
     AuthorizedWorkspaceTools,
@@ -76,6 +77,7 @@ def create_agent() -> Agent[None, str]:
     authorized_tools = AuthorizedWorkspaceTools(executor, execution_context)
     agent = Agent(
         model,
+        model_settings=create_agent_model_settings(),
         instructions=(
             "你是一个中文助手。需要查看工作区文件内容时调用 read_file；"
             "需要列出或搜索工作区文件、查看只读 Git 状态时调用 bash。"

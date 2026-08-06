@@ -1,11 +1,13 @@
 """隔离编写核心函数与 pytest 测试，并由宿主统一执行测试。"""
 
 import asyncio
+import atexit
 from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -36,9 +38,10 @@ ANSI_YELLOW: Final[str] = "\033[33m"
 if str(SOURCE_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SOURCE_DIRECTORY))
 
-from agent_profiles import create_code_test_task_coordinator, create_python_code_agent, create_python_test_agent
+from agent_profiles import create_code_test_task_coordinator, create_python_code_agent, create_python_test_agent, normalize_task_plan
 from agent_runtime import run_observed
 from skill_loading import SkillCatalog, SkillSelector, SkillTaskContext, render_skill_instructions
+from terminal import InteractiveLogRenderer, LogEntry, create_log_renderer
 from tool_execution import (
     InMemoryToolAuditLog,
     ToolApproval,
@@ -50,20 +53,55 @@ from tool_execution import (
 from workspace_tools import WorkspaceBashTool, create_workspace_file_tools
 
 
+_LOG_RENDERER = create_log_renderer()
+if isinstance(_LOG_RENDERER, InteractiveLogRenderer):
+    atexit.register(_LOG_RENDERER.close)
+
+
+def pause_interactive_logs() -> None:
+    """在调用普通 input() 前释放交互式日志的键盘控制权。"""
+    if isinstance(_LOG_RENDERER, InteractiveLogRenderer):
+        _LOG_RENDERER.pause()
+
+
+def resume_interactive_logs() -> None:
+    """在普通 input() 完成后恢复交互式日志。"""
+    if isinstance(_LOG_RENDERER, InteractiveLogRenderer):
+        _LOG_RENDERER.resume()
+
+
 # 保存本轮隔离项目及协调器指定的源码和测试文件。
 @dataclass(frozen=True)
 class IsolatedRun:
     root_directory: Path
     source_file: Path
     test_file: Path
+    visualization_file: Path | None = None
+
+    @property
+    def artifacts_directory(self: "IsolatedRun") -> Path:
+        return self.root_directory / "artifacts"
 
     @property
     def solution_path(self: "IsolatedRun") -> Path:
         return self.source_file
 
 
+@dataclass(frozen=True)
+class VisualizationResult:
+    """保存可视化脚本执行和图片尺寸检查结果。"""
+
+    script_exit_code: int | None
+    image_path: Path | None
+    width: int | None
+    height: int | None
+    error: str | None
+
 # 按事件类型统一输出带颜色的分隔块；NO_COLOR 可用于日志采集或不支持 ANSI 的终端。
 def print_log_block(scope: str, event: str, content: str, color: str, stream: TextIO | None = None) -> None:
+    if stream is None and isinstance(_LOG_RENDERER, InteractiveLogRenderer):
+        _LOG_RENDERER.emit(LogEntry(scope=scope, event=event, content=content, color=color))
+        return
     heading = f"{'=' * 2} [{scope}][{event}] {'=' * (LOG_SEPARATOR_WIDTH - len(scope) - len(event) - 7)}"
     if os.getenv("NO_COLOR") is None:
         heading = f"{color}{heading}{ANSI_RESET}"
@@ -77,17 +115,12 @@ class AgentRunLogger:
         self._agent_name = agent_name
         self._show_model_text = show_model_text
         self._response_number = 0
+        self._pending_tool_arguments: dict[str, list[str]] = {}
 
     # 模型每完成一轮响应就记录轮次；仅对非结构化 Agent 显示原始文本，避免泄露未校验的 JSON/Schema。
     def on_response(self: "AgentRunLogger", response: ModelResponse) -> None:
         self._response_number += 1
         if not self._show_model_text:
-            print_log_block(
-                self._agent_name,
-                f"模型轮次 {self._response_number}",
-                "已收到响应，等待结构化校验。",
-                ANSI_BLUE,
-            )
             return
         contents = [
             part.content
@@ -97,29 +130,45 @@ class AgentRunLogger:
         content = "\n".join(contents) if contents else "（本轮无文本输出，准备调用工具。）"
         print_log_block(self._agent_name, f"模型轮次 {self._response_number}", content, ANSI_BLUE)
 
+    # 结构化输出在校验完成后记录，与对应模型轮次合并为一条用户可读日志。
+    def log_structured_result(self: "AgentRunLogger", content: str) -> None:
+        print_log_block(self._agent_name, f"模型轮次 {self._response_number}", content, ANSI_BLUE)
+
     # 工具开始和完成事件在发生时打印，单条内容有界以避免整文件写入淹没终端。
     def on_event(self: "AgentRunLogger", event: HandleResponseEvent) -> None:
         if isinstance(event, FunctionToolCallEvent):
             arguments = event.part.args
             serialized = json.dumps(arguments, ensure_ascii=False) if isinstance(arguments, dict) else str(arguments)
-            print_log_block(
-                self._agent_name,
-                f"工具开始：{event.part.tool_name}",
-                self._bounded(serialized),
-                ANSI_YELLOW,
-            )
+            self._pending_tool_arguments.setdefault(event.part.tool_name, []).append(self._bounded(serialized))
         elif isinstance(event, FunctionToolResultEvent):
             result_content = event.part.content if isinstance(event.part, ToolReturnPart) else event.content
+            arguments = self._pending_tool_arguments.get(event.part.tool_name, [])
+            serialized_arguments = arguments.pop(0) if arguments else "（参数未记录）"
+            if not arguments:
+                self._pending_tool_arguments.pop(event.part.tool_name, None)
             print_log_block(
                 self._agent_name,
-                f"工具完成：{event.part.tool_name}",
-                self._bounded(str(result_content)),
+                f"工具：{event.part.tool_name} · {self._tool_argument_summary(serialized_arguments)}",
+                f"参数：{serialized_arguments}\n结果：{self._bounded(str(result_content))}",
                 ANSI_GREEN,
             )
 
     # 截断超长的单条日志，并明确标记截断位置。
     def _bounded(self: "AgentRunLogger", value: str) -> str:
         return bounded_log(value)
+
+    # 将常见工具参数提炼到标题，折叠状态下也能区分连续的同名调用。
+    def _tool_argument_summary(self: "AgentRunLogger", arguments: str) -> str:
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError:
+            return self._bounded(arguments).replace("\n", " ")
+        if isinstance(parsed, dict):
+            for key in ("path", "command", "name"):
+                value = parsed.get(key)
+                if value is not None:
+                    return self._bounded(str(value)).replace("\n", " ")
+        return self._bounded(arguments).replace("\n", " ")
 
 
 # 截断会反馈给 Agent 的命令输出，避免单次失败日志占满后续上下文。
@@ -141,15 +190,79 @@ def create_model() -> OpenAIChatModel:
 
 
 # 创建一次性 pytest 项目，并预置协调器指定的源码与测试文件。
-def create_isolated_run(root_directory: Path, source_file: str, test_file: str) -> IsolatedRun:
+def create_isolated_run(
+    root_directory: Path,
+    source_file: str,
+    test_file: str,
+    visualization_file: str | None = None,
+) -> IsolatedRun:
     source_path = _resolve_generated_path(root_directory, source_file, "src")
     test_path = _resolve_generated_path(root_directory, test_file, "tests")
+    visualization_path = (
+        _resolve_generated_path(root_directory, visualization_file, "visualizations")
+        if visualization_file is not None
+        else None
+    )
     source_path.parent.mkdir(parents=True, exist_ok=True)
     test_path.parent.mkdir(parents=True, exist_ok=True)
+    if visualization_path is not None:
+        visualization_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(ROOT_DIRECTORY / "AGENTS.md", root_directory / "AGENTS.md")
     source_path.write_text("# 在此实现核心函数。\n", encoding="utf-8")
     test_path.write_text("# 在此编写 pytest 测试。\n", encoding="utf-8")
-    return IsolatedRun(root_directory, source_path, test_path)
+    if visualization_path is not None:
+        visualization_path.write_text("# 在此编写可视化程序。\n", encoding="utf-8")
+        (root_directory / "artifacts").mkdir(parents=True, exist_ok=True)
+    return IsolatedRun(root_directory, source_path, test_path, visualization_path)
+
+
+# 执行可视化脚本，检查产物是否存在且尺寸处于安全范围。
+def run_visualization(isolated_run: IsolatedRun) -> VisualizationResult:
+    if isolated_run.visualization_file is None:
+        return VisualizationResult(None, None, None, None, "任务未声明可视化脚本。")
+    completed = subprocess.run(
+        [sys.executable, str(isolated_run.visualization_file)],
+        cwd=isolated_run.root_directory,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    if completed.returncode != 0:
+        return VisualizationResult(completed.returncode, None, None, None, completed.stderr[-2_000:])
+    image_candidates = sorted(isolated_run.artifacts_directory.glob("*.png"))
+    if not image_candidates:
+        return VisualizationResult(completed.returncode, None, None, None, "可视化脚本未生成 PNG 图片。")
+    image_path = image_candidates[-1]
+    try:
+        with image_path.open("rb") as image_file:
+            header = image_file.read(24)
+        if header[:8] != b"\x89PNG\r\n\x1a\n":
+            raise ValueError("不是有效的 PNG 文件。")
+        width, height = struct.unpack(">II", header[16:24])
+    except (OSError, ValueError, struct.error) as error:
+        return VisualizationResult(completed.returncode, image_path, None, None, f"无法读取 PNG 尺寸：{error}")
+    if not 32 <= width <= 4_096 or not 32 <= height <= 4_096:
+        return VisualizationResult(completed.returncode, image_path, width, height, "图片尺寸必须位于 32 到 4096 像素之间。")
+    return VisualizationResult(completed.returncode, image_path, width, height, None)
+
+
+# 在支持终端图片协议时尝试内嵌预览，否则输出稳定的路径和尺寸信息。
+def preview_visualization(result: VisualizationResult) -> None:
+    if result.image_path is None:
+        print_log_block("可视化", "检查失败", result.error or "没有图片产物。", ANSI_RED)
+        return
+    summary = f"图片：{result.image_path}\n尺寸：{result.width} × {result.height}"
+    if result.error:
+        print_log_block("可视化", "尺寸检查失败", f"{summary}\n{result.error}", ANSI_RED)
+        return
+    try:
+        from rich.console import Console
+        from rich.image import Image as RichImage
+
+        Console().print(RichImage(str(result.image_path), width=60))
+    except (ImportError, OSError, RuntimeError):
+        print_log_block("可视化", "预览", summary, ANSI_GREEN)
 
 
 # 将模型给出的相对路径限制在指定项目子目录，避免路径逃逸隔离工作区。
@@ -253,13 +366,15 @@ async def run_workflow(problem: str, skill_catalog: SkillCatalog | None = None) 
         on_response=coordinator_logger.on_response,
         on_event=coordinator_logger.on_event,
     )
-    allocation = coordinator_result.output
-    print_log_block(
-        "协调 Agent",
-        "结构化结果",
-        json.dumps(allocation.model_dump(), ensure_ascii=False),
-        ANSI_MAGENTA,
-    )
+    allocation = normalize_task_plan(problem, coordinator_result.output)
+    coordinator_logger.log_structured_result(json.dumps(allocation.model_dump(), ensure_ascii=False, indent=2))
+    if allocation.human_checkpoints:
+        print_log_block(
+            "人工检查点",
+            "任务计划",
+            "\n".join(f"- {checkpoint}" for checkpoint in allocation.human_checkpoints),
+            ANSI_YELLOW,
+        )
     selected_skills = ()
     if skill_catalog is not None:
         selected_skills = SkillSelector(skill_catalog).select(
@@ -276,7 +391,11 @@ async def run_workflow(problem: str, skill_catalog: SkillCatalog | None = None) 
         print_log_block("Skill 路由", "选择结果", selection_summary, ANSI_MAGENTA)
     skill_instructions = render_skill_instructions(selected_skills)
     print_log_block("工作流", "1/4 任务拆分", "核心函数和文件已确定。", ANSI_GREEN)
-    confirmation = input("允许 Agent 在隔离目录中修改文件，并让代码和测试 Agent 编译各自文件吗？[y/N] ").strip().lower()
+    pause_interactive_logs()
+    try:
+        confirmation = input("允许 Agent 在隔离目录中修改文件，并让代码和测试 Agent 编译各自文件吗？[y/N] ").strip().lower()
+    finally:
+        resume_interactive_logs()
     if confirmation != "y":
         print_log_block("工作流", "已取消", "未取得确认，流程结束。", ANSI_YELLOW)
         return False
@@ -287,6 +406,7 @@ async def run_workflow(problem: str, skill_catalog: SkillCatalog | None = None) 
             Path(temporary_directory),
             allocation.source_file,
             allocation.test_file,
+            allocation.visualization_file if allocation.needs_visualization else None,
         )
         print_log_block("工作流", "2/4 隔离项目", "已创建隔离的 pytest 项目。", ANSI_CYAN)
         try:
@@ -307,7 +427,7 @@ async def run_workflow(problem: str, skill_catalog: SkillCatalog | None = None) 
             test_prompt = (
                 f"项目目录是 `{isolated_run.root_directory}`。只读取 AGENTS.md，并只修改 `{isolated_run.test_file}`。\n"
                 f"源码文件：{allocation.source_file}\n核心函数：{allocation.core_function}\n"
-                f"行为要求：{allocation.requirements}\n"
+                f"行为要求：{allocation.requirements}\n验证策略：{allocation.validation_strategy}\n"
                 "使用 pytest 编写正常、边界和错误场景测试；不要读取或修改源码文件。"
                 f"必须使用 bash 运行 `python -m py_compile {allocation.test_file}`，不要使用 `cd` 或 `&&`；"
                 "只有编译通过后才能结束本轮。"
@@ -316,6 +436,7 @@ async def run_workflow(problem: str, skill_catalog: SkillCatalog | None = None) 
                 f"项目目录是 `{isolated_run.root_directory}`。只读取 AGENTS.md，并只修改 `{isolated_run.source_file}`。\n"
                 f"源码文件：{allocation.source_file}\n测试文件：{allocation.test_file}\n"
                 f"核心函数：{allocation.core_function}\n行为要求：{allocation.requirements}\n"
+                f"验证策略：{allocation.validation_strategy}\n"
                 "实现核心函数；不要读取或修改测试文件。"
                 f"必须使用 bash 运行 `python -m py_compile {allocation.source_file}`，不要使用 `cd` 或 `&&`；"
                 "只有编译通过后才能结束本轮。"
@@ -345,6 +466,35 @@ async def run_workflow(problem: str, skill_catalog: SkillCatalog | None = None) 
             # 代码先完成，避免两个 Agent 同时写日志；测试 Agent 随后仅依据需求验证公开行为。
             await generate_code(code_prompt, "3/4 代码 Agent")
             await generate_tests()
+            if allocation.needs_visualization and isolated_run.visualization_file is not None:
+                pause_interactive_logs()
+                try:
+                    visualization_approval = input(
+                        "是否生成数学可视化程序 "
+                        f"{allocation.visualization_file}？[y/N] "
+                    ).strip().lower() == "y"
+                finally:
+                    resume_interactive_logs()
+                if visualization_approval:
+                    visualization_prompt = (
+                        f"项目目录是 `{isolated_run.root_directory}`。只读取 AGENTS.md 和 "
+                        f"`{isolated_run.source_file}`，只修改 `{isolated_run.visualization_file}`。\n"
+                        f"核心函数：{allocation.core_function}\n行为要求：{allocation.requirements}\n"
+                        f"验证策略：{allocation.validation_strategy}\n"
+                        f"必须将 PNG 图片保存为 `{isolated_run.root_directory / 'artifacts' / 'visualization.png'}`。"
+                        "使用 matplotlib 或任务适合的可视化库，生成可重复运行的可视化脚本；"
+                        "脚本必须从源码导入核心函数，不要修改源码或测试文件。"
+                    )
+                    print_log_block("工作流", "3/4 可视化 Agent", "已启动。", ANSI_CYAN)
+                    await run_observed(
+                        code_agent,
+                        visualization_prompt,
+                        on_response=code_logger.on_response,
+                        on_event=code_logger.on_event,
+                    )
+                    print_log_block("工作流", "3/4 可视化 Agent", "可视化脚本已生成。", ANSI_GREEN)
+                    visualization_result = run_visualization(isolated_run)
+                    preview_visualization(visualization_result)
             print_log_block("工作流", "4/4 pytest", "正在运行 pytest。", ANSI_CYAN)
             completed = run_pytest(isolated_run.root_directory, isolated_run.test_file)
             for retry_attempt in range(1, MAX_VALIDATION_RETRIES + 1):

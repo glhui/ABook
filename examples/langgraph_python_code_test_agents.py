@@ -24,6 +24,7 @@ from agent_profiles import (
     create_code_test_task_coordinator,
     create_python_code_agent,
     create_python_test_agent,
+    normalize_task_plan,
 )
 from agent_runtime import run_observed
 from examples.python_code_test_agents import (
@@ -43,6 +44,10 @@ from examples.python_code_test_agents import (
     create_code_retry_prompt,
     print_log_block,
     publish_submission,
+    preview_visualization,
+    pause_interactive_logs,
+    resume_interactive_logs,
+    run_visualization,
     run_pytest,
 )
 from skill_loading import SelectedSkill, SkillCatalog, SkillSelector, SkillTaskContext, render_skill_instructions
@@ -58,9 +63,10 @@ class CodeTestWorkflowState(TypedDict, total=False):
     skill_instructions: str
     repair_attempt: int
     workflow_succeeded: bool
+    visualization_approved: bool
 
 
-WorkflowRoute = Literal["prepare_workspace", "cancel", "implement_code", "write_tests", "validate", "finish"]
+WorkflowRoute = Literal["prepare_workspace", "cancel", "implement_code", "write_tests", "visualize", "validate", "finish"]
 
 
 # 构建只负责流程转换的 LangGraph，具体 Agent、工具和宿主验证逻辑沿用现有示例。
@@ -84,13 +90,15 @@ def create_code_test_workflow(
             on_response=coordinator_logger.on_response,
             on_event=coordinator_logger.on_event,
         )
-        allocation = result.output
-        print_log_block(
-            "协调 Agent",
-            "结构化结果",
-            allocation.model_dump_json(indent=2),
-            ANSI_MAGENTA,
-        )
+        allocation = normalize_task_plan(state["problem"], result.output)
+        coordinator_logger.log_structured_result(allocation.model_dump_json(indent=2))
+        if allocation.human_checkpoints:
+            print_log_block(
+                "人工检查点",
+                "任务计划",
+                "\n".join(f"- {checkpoint}" for checkpoint in allocation.human_checkpoints),
+                ANSI_YELLOW,
+            )
         selected_skills = select_code_skills(skill_catalog, allocation, state["problem"])
         skill_instructions = render_skill_instructions(selected_skills)
         selection_summary = "\n".join(
@@ -107,7 +115,12 @@ def create_code_test_workflow(
     # 在确认后建立隔离项目，确保后续所有节点共享同一份源码与测试文件。
     def prepare_workspace(state: CodeTestWorkflowState) -> CodeTestWorkflowState:
         allocation = state["allocation"]
-        isolated_run = create_isolated_run(run_directory, allocation.source_file, allocation.test_file)
+        isolated_run = create_isolated_run(
+            run_directory,
+            allocation.source_file,
+            allocation.test_file,
+            allocation.visualization_file if allocation.needs_visualization else None,
+        )
         print_log_block("工作流", "2/4 隔离项目", "已创建隔离的 pytest 项目。", ANSI_CYAN)
         return {"isolated_run": isolated_run}
 
@@ -137,8 +150,9 @@ def create_code_test_workflow(
         else:
             prompt = (
                 f"项目目录是 `{isolated_run.root_directory}`。只读取 AGENTS.md，并只修改 `{isolated_run.source_file}`。\n"
-                f"源码文件：{allocation.source_file}\n测试文件：{allocation.test_file}\n"
-                f"核心函数：{allocation.core_function}\n行为要求：{allocation.requirements}\n"
+            f"源码文件：{allocation.source_file}\n测试文件：{allocation.test_file}\n"
+            f"核心函数：{allocation.core_function}\n行为要求：{allocation.requirements}\n"
+            f"验证策略：{allocation.validation_strategy}\n"
                 "实现核心函数；不要读取或修改测试文件。"
                 f"必须使用 bash 运行 `python -m py_compile {allocation.source_file}`，不要使用 `cd` 或 `&&`；"
                 "只有编译通过后才能结束本轮。"
@@ -162,7 +176,7 @@ def create_code_test_workflow(
         prompt = (
             f"项目目录是 `{isolated_run.root_directory}`。只读取 AGENTS.md，并只修改 `{isolated_run.test_file}`。\n"
             f"源码文件：{allocation.source_file}\n核心函数：{allocation.core_function}\n"
-            f"行为要求：{allocation.requirements}\n"
+            f"行为要求：{allocation.requirements}\n验证策略：{allocation.validation_strategy}\n"
             "使用 pytest 编写正常、边界和错误场景测试；不要读取或修改源码文件。"
             f"必须使用 bash 运行 `python -m py_compile {allocation.test_file}`，不要使用 `cd` 或 `&&`；"
             "只有编译通过后才能结束本轮。"
@@ -171,6 +185,35 @@ def create_code_test_workflow(
         await run_observed(test_agent, prompt, on_response=test_logger.on_response, on_event=test_logger.on_event)
         print_log_block("工作流", "3/4 测试 Agent", "测试文件已编译通过。", ANSI_GREEN)
         return {}
+
+    # 可视化节点仅修改规划阶段指定的脚本，并在开始前再次取得人工确认。
+    async def visualize(state: CodeTestWorkflowState) -> CodeTestWorkflowState:
+        allocation = state["allocation"]
+        isolated_run = state["isolated_run"]
+        if not allocation.needs_visualization or isolated_run.visualization_file is None:
+            return {"visualization_approved": False}
+        if not confirm():
+            print_log_block("工作流", "3/4 可视化", "人工跳过可视化。", ANSI_YELLOW)
+            return {"visualization_approved": False}
+        visualization_agent = create_python_code_agent(
+            model,
+            create_isolated_executor(isolated_run.root_directory),
+            create_file_only_context("python-code", "write-visualization", allow_bash=True),
+            skill_instructions=state["skill_instructions"] or None,
+        )
+        prompt = (
+            f"项目目录是 `{isolated_run.root_directory}`。只读取 AGENTS.md 和 `{isolated_run.source_file}`，"
+            f"只修改 `{isolated_run.visualization_file}`。\n核心函数：{allocation.core_function}\n"
+            f"行为要求：{allocation.requirements}\n验证策略：{allocation.validation_strategy}\n"
+            f"必须将 PNG 图片保存为 `{isolated_run.root_directory / 'artifacts' / 'visualization.png'}`。"
+            "使用 matplotlib 或任务适合的可视化库，生成可重复运行的可视化脚本；"
+            "脚本必须从源码导入核心函数，不要修改源码或测试文件。"
+        )
+        print_log_block("工作流", "3/4 可视化 Agent", "已启动。", ANSI_CYAN)
+        await run_observed(visualization_agent, prompt)
+        print_log_block("工作流", "3/4 可视化 Agent", "可视化脚本已生成。", ANSI_GREEN)
+        preview_visualization(run_visualization(isolated_run))
+        return {"visualization_approved": True}
 
     # 宿主独立运行 pytest，并把真实结果写回图状态供条件边选择下一节点。
     def validate(state: CodeTestWorkflowState) -> CodeTestWorkflowState:
@@ -198,6 +241,10 @@ def create_code_test_workflow(
     def route_after_code(state: CodeTestWorkflowState) -> WorkflowRoute:
         return "validate" if state["repair_attempt"] else "write_tests"
 
+    # 测试完成后仅在规划要求时进入可视化节点。
+    def route_after_tests(state: CodeTestWorkflowState) -> WorkflowRoute:
+        return "visualize" if state["allocation"].needs_visualization else "validate"
+
     # 确认分支在协调结果生成后发生，保持原示例的交互顺序。
     def route_after_plan(state: CodeTestWorkflowState) -> WorkflowRoute:
         return "prepare_workspace" if state["approved"] else "cancel"
@@ -206,6 +253,7 @@ def create_code_test_workflow(
     graph.add_node("prepare_workspace", prepare_workspace)
     graph.add_node("implement_code", implement_code)
     graph.add_node("write_tests", write_tests)
+    graph.add_node("visualize", visualize)
     graph.add_node("validate", validate)
     graph.add_node("finish", finish)
     graph.add_node("cancel", cancel)
@@ -213,7 +261,8 @@ def create_code_test_workflow(
     graph.add_conditional_edges("plan", route_after_plan, {"prepare_workspace": "prepare_workspace", "cancel": "cancel"})
     graph.add_edge("prepare_workspace", "implement_code")
     graph.add_conditional_edges("implement_code", route_after_code, {"write_tests": "write_tests", "validate": "validate"})
-    graph.add_edge("write_tests", "validate")
+    graph.add_conditional_edges("write_tests", route_after_tests, {"visualize": "visualize", "validate": "validate"})
+    graph.add_edge("visualize", "validate")
     graph.add_conditional_edges("validate", route_after_validation, {"implement_code": "implement_code", "finish": "finish"})
     graph.add_edge("finish", END)
     graph.add_edge("cancel", END)
@@ -245,7 +294,11 @@ async def run_workflow(problem: str) -> bool:
 
     # 将交互式确认封装为图节点可调用的无参回调，便于测试时替换。
     def confirm() -> bool:
-        answer = input("允许 Agent 在隔离目录中修改文件，并让代码和测试 Agent 编译各自文件吗？[y/N] ")
+        pause_interactive_logs()
+        try:
+            answer = input("允许 Agent 在隔离目录中修改文件，并让代码和测试 Agent 编译各自文件吗？[y/N] ")
+        finally:
+            resume_interactive_logs()
         return answer.strip().lower() == "y"
 
     with TemporaryDirectory(prefix="langgraph-run-", dir=RUNS_DIRECTORY) as temporary_directory:
